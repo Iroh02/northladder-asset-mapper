@@ -1,9 +1,8 @@
 """
 NorthLadder Asset Mapping Tool — Streamlit UI
 
-Architecture:
-    Phase 1 (one-time): Upload NL master list -> cleaned & saved to disk
-    Phase 2 (daily use): Upload any Excel with asset sheets -> all matched against saved NL
+The NL master catalog is bundled with the app (nl_reference/).
+Users only need to upload their asset list Excel files.
 
 Run with:
     streamlit run app.py
@@ -58,68 +57,50 @@ st.sidebar.markdown("🟢 **MATCHED** — Single confident match")
 st.sidebar.markdown("🟡 **MULTIPLE_MATCHES** — Multiple IDs, needs review")
 st.sidebar.markdown("🔴 **NO_MATCH** — Below threshold, manual mapping needed")
 
-# =========================================================================
-# STEP 1 — NL Reference (one-time)
-# =========================================================================
-st.header("Step 1: NorthLadder Reference Catalog")
-
-has_reference = nl_reference_exists()
-
-if has_reference:
-    nl_data = load_nl_reference()
-    if nl_data is not None:
-        df_nl_clean, nl_stats = nl_data
-        st.success(
-            f"NL Reference loaded — **{nl_stats['final']:,}** usable records "
-            f"(from {nl_stats['original']:,} original, "
-            f"{nl_stats['null_dropped']:,} null + {nl_stats['test_dropped']:,} test dropped)"
-        )
-        with st.expander("Preview NL Reference (first 10 rows)"):
-            st.dataframe(df_nl_clean.head(10), use_container_width=True, hide_index=True)
-
-        if st.button("Refresh NL Reference", help="Re-upload the NL catalog if it has been updated"):
+# Admin: refresh NL reference (hidden in sidebar expander)
+with st.sidebar.expander("Admin: NL Reference"):
+    if nl_reference_exists():
+        nl_data = load_nl_reference()
+        if nl_data:
+            _, nl_meta = nl_data
+            st.caption(f"Loaded {nl_meta['final']:,} records")
+        if st.button("Refresh NL Reference"):
             delete_nl_reference()
             st.rerun()
     else:
-        has_reference = False
-
-if not has_reference:
-    st.info(
-        "No NL reference saved yet. Upload your NorthLadder master Excel "
-        "(must have a **NorthLadder List** sheet)."
-    )
-    nl_upload = st.file_uploader("Upload NL Master Excel (.xlsx)", type=["xlsx"], key="nl_upload")
-
-    if nl_upload is not None:
-        try:
-            df_nl_raw = parse_nl_sheet(nl_upload)
-        except Exception as e:
-            st.error(f"Failed to parse NL sheet: {e}")
-            st.stop()
-
-        st.write(f"Parsed **{len(df_nl_raw):,}** raw NL rows.")
-
-        if st.button("Save as NL Reference", type="primary"):
-            with st.spinner("Cleaning and saving..."):
-                df_nl_clean, nl_stats = load_and_clean_nl_list(df_nl_raw)
-                save_nl_reference(df_nl_clean, nl_stats)
-            st.success(f"Saved {nl_stats['final']:,} usable records.")
+        st.warning("No NL reference found")
+    nl_admin_upload = st.file_uploader("Upload new NL Master", type=["xlsx"], key="nl_admin")
+    if nl_admin_upload is not None:
+        if st.button("Save NL Reference"):
+            with st.spinner("Saving..."):
+                df_raw = parse_nl_sheet(nl_admin_upload)
+                df_clean, stats = load_and_clean_nl_list(df_raw)
+                save_nl_reference(df_clean, stats)
+            st.success(f"Saved {stats['final']:,} records")
             st.rerun()
 
+# =========================================================================
+# Load NL reference (bundled with app)
+# =========================================================================
+if not nl_reference_exists():
+    st.error(
+        "NL reference catalog not found. "
+        "Use the Admin panel in the sidebar to upload the NorthLadder master Excel."
+    )
     st.stop()
 
-# Build lookup once from saved reference
+df_nl_clean, nl_stats = load_nl_reference()
 nl_lookup = build_nl_lookup(df_nl_clean)
 nl_names = list(nl_lookup.keys())
 
-# =========================================================================
-# STEP 2 — Upload asset lists & run matching
-# =========================================================================
-st.divider()
-st.header("Step 2: Upload Asset Lists & Run Mapping")
-st.markdown("Upload any Excel file — all sheets will be auto-detected and matched against the NL reference.")
+st.success(f"NL Reference: **{nl_stats['final']:,}** asset records loaded")
 
-asset_upload = st.file_uploader("Upload Asset Lists Excel (.xlsx)", type=["xlsx"], key="asset_upload")
+# =========================================================================
+# Upload asset lists & run matching
+# =========================================================================
+st.markdown("Upload an Excel file with your asset lists — all sheets are auto-detected and matched.")
+
+asset_upload = st.file_uploader("📁 Upload Asset Lists (.xlsx)", type=["xlsx"], key="asset_upload")
 
 if asset_upload is not None:
     try:
@@ -129,16 +110,16 @@ if asset_upload is not None:
         st.stop()
 
     if not detected_sheets:
-        st.warning("No matchable sheets found. Make sure the Excel has sheets with product name columns.")
+        st.warning("No matchable sheets found. Make sure your Excel has columns with product names.")
         st.stop()
 
-    # Show what was detected
+    # Show detected sheets
     st.subheader(f"📊 Detected {len(detected_sheets)} sheet(s)")
     for sheet_name, info in detected_sheets.items():
-        brand_label = info['brand_col'] or '(none — will match on name only)'
+        brand_label = info['brand_col'] or '(none)'
         st.markdown(
             f"- **{sheet_name}** — {len(info['df']):,} rows | "
-            f"Brand col: `{brand_label}` | Name col: `{info['name_col']}`"
+            f"Brand: `{brand_label}` | Name: `{info['name_col']}`"
         )
 
     with st.expander("Preview Raw Data"):
@@ -178,12 +159,12 @@ if asset_upload is not None:
             st.dataframe(alt_df[['nl_name', 'score', 'status', 'asset_ids']], use_container_width=True, hide_index=True)
 
     # ------------------------------------------------------------------
-    # Run full mapping on ALL sheets
+    # Run full mapping
     # ------------------------------------------------------------------
     st.divider()
     if st.button("🚀 Run Asset Mapping", type="primary", use_container_width=True):
 
-        all_results = {}  # sheet_name -> df_result
+        all_results = {}
 
         for sheet_name, info in detected_sheets.items():
             st.subheader(f"🔍 Matching: {sheet_name}")
@@ -206,7 +187,6 @@ if asset_upload is not None:
             progress.progress(1.0, text=f"✅ {sheet_name} complete!")
             all_results[sheet_name] = df_result
 
-            # Stats
             matched = (df_result['match_status'] == MATCH_STATUS_MATCHED).sum()
             multiple = (df_result['match_status'] == MATCH_STATUS_MULTIPLE).sum()
             no_match = (df_result['match_status'] == MATCH_STATUS_NO_MATCH).sum()
@@ -218,7 +198,7 @@ if asset_upload is not None:
             cc.metric("❌ No Match", no_match, f"{no_match/total*100:.1f}%")
 
         # ------------------------------------------------------------------
-        # Preview results
+        # Preview
         # ------------------------------------------------------------------
         st.subheader("📋 Preview Results")
 
@@ -241,20 +221,20 @@ if asset_upload is not None:
                 n_unmatched = (df_result['match_status'] == MATCH_STATUS_NO_MATCH).sum()
                 if n_unmatched > 0:
                     with st.expander(f"View {n_unmatched} Unmatched Items"):
-                        unmatched = df_result[df_result['match_status'] == MATCH_STATUS_NO_MATCH]
-                        st.dataframe(unmatched, use_container_width=True, hide_index=True)
+                        st.dataframe(
+                            df_result[df_result['match_status'] == MATCH_STATUS_NO_MATCH],
+                            use_container_width=True, hide_index=True,
+                        )
 
         # ------------------------------------------------------------------
-        # Build output Excel
+        # Output Excel
         # ------------------------------------------------------------------
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            # Each sheet's mapped results
             for sheet_name, df_result in all_results.items():
-                safe_name = f"{sheet_name} - Mapped"[:31]  # Excel 31-char sheet name limit
+                safe_name = f"{sheet_name} - Mapped"[:31]
                 df_result.to_excel(writer, sheet_name=safe_name, index=False)
 
-            # Summary
             summary_rows = []
             for sheet_name, df_result in all_results.items():
                 total = len(df_result)
@@ -262,26 +242,18 @@ if asset_upload is not None:
                 multiple = int((df_result['match_status'] == MATCH_STATUS_MULTIPLE).sum())
                 no_match = int((df_result['match_status'] == MATCH_STATUS_NO_MATCH).sum())
                 summary_rows.append({
-                    'Sheet': sheet_name,
-                    'Total': total,
-                    'Matched': matched,
-                    'Multiple Matches': multiple,
-                    'No Match': no_match,
-                    'Match Rate': f"{matched/total*100:.2f}%",
+                    'Sheet': sheet_name, 'Total': total,
+                    'Matched': matched, 'Multiple Matches': multiple,
+                    'No Match': no_match, 'Match Rate': f"{matched/total*100:.2f}%",
                 })
+            summary_rows.append({'Sheet': '', 'Total': '', 'Matched': '', 'Multiple Matches': '', 'No Match': '', 'Match Rate': ''})
             summary_rows.append({
-                'Sheet': '', 'Total': '', 'Matched': '',
-                'Multiple Matches': '', 'No Match': '',
-                'Match Rate': '',
-            })
-            summary_rows.append({
-                'Sheet': 'NL Reference Records', 'Total': nl_stats['final'],
-                'Matched': '', 'Multiple Matches': '',
-                'No Match': '', 'Match Rate': f"Threshold: {threshold}%",
+                'Sheet': 'NL Reference', 'Total': nl_stats['final'],
+                'Matched': '', 'Multiple Matches': '', 'No Match': '',
+                'Match Rate': f"Threshold: {threshold}%",
             })
             pd.DataFrame(summary_rows).to_excel(writer, sheet_name='Summary', index=False)
 
-            # Unmatched sheets for manual review
             for sheet_name, df_result in all_results.items():
                 unmatched = df_result[df_result['match_status'] == MATCH_STATUS_NO_MATCH]
                 if len(unmatched) > 0:
@@ -307,6 +279,5 @@ if asset_upload is not None:
 st.divider()
 st.caption(
     "NorthLadder Asset Mapper v1.0 — "
-    "Auto-detects all sheets, fuzzy matches with rapidfuzz. "
-    "NL reference is saved locally and reused across sessions."
+    "Fuzzy matching with rapidfuzz. NL catalog pre-loaded."
 )
