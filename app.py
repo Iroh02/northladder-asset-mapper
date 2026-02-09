@@ -24,9 +24,14 @@ from matcher import (
     nl_reference_exists,
     delete_nl_reference,
     SIMILARITY_THRESHOLD,
+    HIGH_CONFIDENCE_THRESHOLD,
     MATCH_STATUS_MATCHED,
     MATCH_STATUS_MULTIPLE,
+    MATCH_STATUS_SUGGESTED,
     MATCH_STATUS_NO_MATCH,
+    CONFIDENCE_HIGH,
+    CONFIDENCE_MEDIUM,
+    CONFIDENCE_LOW,
 )
 
 # ---------------------------------------------------------------------------
@@ -52,10 +57,11 @@ threshold = st.sidebar.slider(
 )
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("**Status Legend:**")
-st.sidebar.markdown("🟢 **MATCHED** — Single confident match")
-st.sidebar.markdown("🟡 **MULTIPLE_MATCHES** — Multiple IDs, needs review")
-st.sidebar.markdown("🔴 **NO_MATCH** — Below threshold, manual mapping needed")
+st.sidebar.markdown("**Confidence Tiers:**")
+st.sidebar.markdown("🟢 **MATCHED** (HIGH) — Auto-apply, score >= 95%")
+st.sidebar.markdown("🟡 **SUGGESTED** (MEDIUM) — Needs review, score 85-94%")
+st.sidebar.markdown("🔴 **NO_MATCH** (LOW) — Manual mapping, score < 85%")
+st.sidebar.markdown("🔵 **MULTIPLE_MATCHES** — Multiple IDs for same name")
 
 # Admin: refresh NL reference (hidden in sidebar expander)
 with st.sidebar.expander("Admin: NL Reference"):
@@ -189,13 +195,15 @@ if asset_upload is not None:
 
             matched = (df_result['match_status'] == MATCH_STATUS_MATCHED).sum()
             multiple = (df_result['match_status'] == MATCH_STATUS_MULTIPLE).sum()
+            suggested = (df_result['match_status'] == MATCH_STATUS_SUGGESTED).sum()
             no_match = (df_result['match_status'] == MATCH_STATUS_NO_MATCH).sum()
             total = len(df_result)
 
-            ca, cb, cc = st.columns(3)
-            ca.metric("✅ Matched", matched, f"{matched/total*100:.1f}%")
-            cb.metric("⚠️ Multiple", multiple, f"{multiple/total*100:.1f}%")
-            cc.metric("❌ No Match", no_match, f"{no_match/total*100:.1f}%")
+            ca, cb, cc, cd = st.columns(4)
+            ca.metric("🟢 Matched (HIGH)", matched, f"{matched/total*100:.1f}%")
+            cb.metric("🟡 Suggested (MEDIUM)", suggested, f"{suggested/total*100:.1f}%")
+            cc.metric("🔵 Multiple IDs", multiple, f"{multiple/total*100:.1f}%")
+            cd.metric("🔴 No Match", no_match, f"{no_match/total*100:.1f}%")
 
         # ------------------------------------------------------------------
         # Preview
@@ -205,8 +213,10 @@ if asset_upload is not None:
         def color_status(val):
             if val == MATCH_STATUS_MATCHED:
                 return 'background-color: #d4edda; color: #155724'
-            elif val == MATCH_STATUS_MULTIPLE:
+            elif val == MATCH_STATUS_SUGGESTED:
                 return 'background-color: #fff3cd; color: #856404'
+            elif val == MATCH_STATUS_MULTIPLE:
+                return 'background-color: #cce5ff; color: #004085'
             elif val == MATCH_STATUS_NO_MATCH:
                 return 'background-color: #f8d7da; color: #721c24'
             return ''
@@ -218,6 +228,15 @@ if asset_upload is not None:
                     df_result.head(100).style.map(color_status, subset=['match_status']),
                     use_container_width=True, hide_index=True,
                 )
+                # Show items needing review (SUGGESTED)
+                n_suggested = (df_result['match_status'] == MATCH_STATUS_SUGGESTED).sum()
+                if n_suggested > 0:
+                    with st.expander(f"Review {n_suggested} Suggested Matches (85-94%)"):
+                        st.dataframe(
+                            df_result[df_result['match_status'] == MATCH_STATUS_SUGGESTED],
+                            use_container_width=True, hide_index=True,
+                        )
+                # Show unmatched items
                 n_unmatched = (df_result['match_status'] == MATCH_STATUS_NO_MATCH).sum()
                 if n_unmatched > 0:
                     with st.expander(f"View {n_unmatched} Unmatched Items"):
@@ -239,22 +258,28 @@ if asset_upload is not None:
             for sheet_name, df_result in all_results.items():
                 total = len(df_result)
                 matched = int((df_result['match_status'] == MATCH_STATUS_MATCHED).sum())
+                suggested = int((df_result['match_status'] == MATCH_STATUS_SUGGESTED).sum())
                 multiple = int((df_result['match_status'] == MATCH_STATUS_MULTIPLE).sum())
                 no_match = int((df_result['match_status'] == MATCH_STATUS_NO_MATCH).sum())
                 summary_rows.append({
                     'Sheet': sheet_name, 'Total': total,
-                    'Matched': matched, 'Multiple Matches': multiple,
-                    'No Match': no_match, 'Match Rate': f"{matched/total*100:.2f}%",
+                    'Matched (HIGH)': matched, 'Suggested (MEDIUM)': suggested,
+                    'Multiple IDs': multiple, 'No Match': no_match,
+                    'Auto-Apply Rate': f"{matched/total*100:.2f}%",
                 })
-            summary_rows.append({'Sheet': '', 'Total': '', 'Matched': '', 'Multiple Matches': '', 'No Match': '', 'Match Rate': ''})
+            summary_rows.append({'Sheet': '', 'Total': '', 'Matched (HIGH)': '', 'Suggested (MEDIUM)': '', 'Multiple IDs': '', 'No Match': '', 'Auto-Apply Rate': ''})
             summary_rows.append({
                 'Sheet': 'NL Reference', 'Total': nl_stats['final'],
-                'Matched': '', 'Multiple Matches': '', 'No Match': '',
-                'Match Rate': f"Threshold: {threshold}%",
+                'Matched (HIGH)': '', 'Suggested (MEDIUM)': '', 'Multiple IDs': '', 'No Match': '',
+                'Auto-Apply Rate': f"Auto-accept >= {HIGH_CONFIDENCE_THRESHOLD}%",
             })
             pd.DataFrame(summary_rows).to_excel(writer, sheet_name='Summary', index=False)
 
             for sheet_name, df_result in all_results.items():
+                suggested = df_result[df_result['match_status'] == MATCH_STATUS_SUGGESTED]
+                if len(suggested) > 0:
+                    safe_name = f"{sheet_name} - Review"[:31]
+                    suggested.to_excel(writer, sheet_name=safe_name, index=False)
                 unmatched = df_result[df_result['match_status'] == MATCH_STATUS_NO_MATCH]
                 if len(unmatched) > 0:
                     safe_name = f"{sheet_name} - Unmatched"[:31]

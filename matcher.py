@@ -8,10 +8,12 @@ Matching Approach:
     - Token-sort is chosen because List 1 names ("iPhone 6 16GB") and NL names
       ("Apple iPhone 6 (2014), 16GB") contain the same tokens in different orders/formats
 
-Threshold Choice:
-    - 85% was chosen as a balance between precision and recall
-    - Below 85%, false positives increase significantly (e.g., "iPhone 6" matching "iPhone 6S")
-    - Above 85%, legitimate matches with minor formatting differences get missed
+Threshold / Confidence Tiers:
+    - >= 95%: HIGH confidence (auto-accept) — safe to apply UAE Asset ID directly
+    - 85-94%: MEDIUM confidence (SUGGESTED) — needs human review, shows top candidates
+    - < 85%:  LOW confidence (NO_MATCH) — manual mapping required
+    - The 85-94% zone contains false positives (e.g., iPhone 4 → iPhone 6 at 95%)
+      so these are flagged for review rather than auto-accepted
 
 Duplicate Handling:
     - If multiple NL entries share the exact same asset name (after cleaning),
@@ -29,11 +31,17 @@ from typing import Dict, List, Callable, Optional, Tuple
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-SIMILARITY_THRESHOLD = 85  # Minimum score for a valid match
+SIMILARITY_THRESHOLD = 85   # Minimum score to appear as a candidate at all
+HIGH_CONFIDENCE_THRESHOLD = 95  # Auto-accept: safe to apply without review
 
-MATCH_STATUS_MATCHED = "MATCHED"
-MATCH_STATUS_MULTIPLE = "MULTIPLE_MATCHES"
-MATCH_STATUS_NO_MATCH = "NO_MATCH"
+MATCH_STATUS_MATCHED = "MATCHED"           # >= 95% single ID — auto-apply
+MATCH_STATUS_MULTIPLE = "MULTIPLE_MATCHES" # >= 95% but multiple IDs for same name
+MATCH_STATUS_SUGGESTED = "SUGGESTED"       # 85-94% — needs human review
+MATCH_STATUS_NO_MATCH = "NO_MATCH"         # < 85% — manual mapping required
+
+CONFIDENCE_HIGH = "HIGH"      # >= 95%
+CONFIDENCE_MEDIUM = "MEDIUM"  # 85-94%
+CONFIDENCE_LOW = "LOW"        # < 85%
 
 
 # ---------------------------------------------------------------------------
@@ -228,31 +236,47 @@ def match_single_item(
             'mapped_uae_assetid': '',
             'match_score': 0,
             'match_status': MATCH_STATUS_NO_MATCH,
+            'confidence': CONFIDENCE_LOW,
             'matched_on': '',
         }
 
     best_match, score, _ = result
     asset_ids = nl_lookup.get(best_match, [])
+    score_rounded = round(score, 2)
+
+    # Determine confidence tier
+    if score >= HIGH_CONFIDENCE_THRESHOLD:
+        confidence = CONFIDENCE_HIGH
+    elif score >= SIMILARITY_THRESHOLD:
+        confidence = CONFIDENCE_MEDIUM
+    else:
+        confidence = CONFIDENCE_LOW
 
     if len(asset_ids) == 0:
         return {
             'mapped_uae_assetid': '',
-            'match_score': round(score, 2),
+            'match_score': score_rounded,
             'match_status': MATCH_STATUS_NO_MATCH,
+            'confidence': confidence,
             'matched_on': best_match,
         }
-    elif len(asset_ids) == 1:
+    elif confidence == CONFIDENCE_HIGH:
+        # >= 95%: safe to auto-apply
+        status = MATCH_STATUS_MULTIPLE if len(asset_ids) > 1 else MATCH_STATUS_MATCHED
         return {
-            'mapped_uae_assetid': asset_ids[0],
-            'match_score': round(score, 2),
-            'match_status': MATCH_STATUS_MATCHED,
+            'mapped_uae_assetid': ', '.join(asset_ids),
+            'match_score': score_rounded,
+            'match_status': status,
+            'confidence': confidence,
             'matched_on': best_match,
         }
     else:
+        # 85-94%: SUGGESTED — needs human review, show best candidate but don't auto-accept
         return {
             'mapped_uae_assetid': ', '.join(asset_ids),
-            'match_score': round(score, 2),
-            'match_status': MATCH_STATUS_MULTIPLE,
+            'match_score': score_rounded,
+            'match_status': MATCH_STATUS_SUGGESTED,
+            'confidence': confidence,
             'matched_on': best_match,
         }
 
@@ -301,6 +325,7 @@ def run_matching(
     df['mapped_uae_assetid'] = results_df['mapped_uae_assetid'].values
     df['match_score'] = results_df['match_score'].values
     df['match_status'] = results_df['match_status'].values
+    df['confidence'] = results_df['confidence'].values
     df['matched_on'] = results_df['matched_on'].values
 
     return df
@@ -341,11 +366,17 @@ def test_single_match(
     alternatives = []
     for match_name, score, _ in top_matches:
         asset_ids = nl_lookup.get(match_name, [])
+        if score >= HIGH_CONFIDENCE_THRESHOLD:
+            alt_status = 'HIGH'
+        elif score >= threshold:
+            alt_status = 'MEDIUM'
+        else:
+            alt_status = 'LOW'
         alternatives.append({
             'nl_name': match_name,
             'score': round(score, 2),
             'asset_ids': asset_ids,
-            'status': 'MATCHED' if score >= threshold else 'BELOW_THRESHOLD',
+            'status': alt_status,
         })
 
     best = match_single_item(query, nl_lookup, nl_names, threshold)
