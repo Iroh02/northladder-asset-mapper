@@ -10,7 +10,7 @@ Matching Approach:
 
 Threshold / Confidence Tiers:
     - >= 95%: HIGH confidence (auto-accept) — safe to apply UAE Asset ID directly
-    - 85-94%: MEDIUM confidence (SUGGESTED) — needs human review, shows top candidates
+    - 85-94%: MEDIUM confidence (REVIEW_REQUIRED) — needs human review, shows top candidates
     - < 85%:  LOW confidence (NO_MATCH) — manual mapping required
     - The 85-94% zone contains false positives (e.g., iPhone 4 → iPhone 6 at 95%)
       so these are flagged for review rather than auto-accepted
@@ -36,7 +36,7 @@ HIGH_CONFIDENCE_THRESHOLD = 95  # Auto-accept: safe to apply without review
 
 MATCH_STATUS_MATCHED = "MATCHED"           # >= 95% single ID — auto-apply
 MATCH_STATUS_MULTIPLE = "MULTIPLE_MATCHES" # >= 95% but multiple IDs for same name
-MATCH_STATUS_SUGGESTED = "SUGGESTED"       # 85-94% — needs human review
+MATCH_STATUS_SUGGESTED = "REVIEW_REQUIRED"  # 85-94% — needs human review
 MATCH_STATUS_NO_MATCH = "NO_MATCH"         # < 85% — manual mapping required
 
 CONFIDENCE_HIGH = "HIGH"      # >= 95%
@@ -220,6 +220,7 @@ def match_single_item(
             'mapped_uae_assetid': '',
             'match_score': 0,
             'match_status': MATCH_STATUS_NO_MATCH,
+            'confidence': CONFIDENCE_LOW,
             'matched_on': '',
         }
 
@@ -242,6 +243,18 @@ def match_single_item(
 
     best_match, score, _ = result
     asset_ids = nl_lookup.get(best_match, [])
+
+    # Numeric proximity guardrail: catch model number mismatches
+    # e.g., "iPhone 4" vs "iPhone 11" score 87% on token_sort but are wrong products
+    # Extract short model numbers (1-2 digits, not storage like 128gb) and penalize
+    if score < HIGH_CONFIDENCE_THRESHOLD:
+        q_nums = re.findall(r'(?<!\d)(\d{1,2})(?!\d|gb|tb|mb)', query)
+        m_nums = re.findall(r'(?<!\d)(\d{1,2})(?!\d|gb|tb|mb)', best_match)
+        if q_nums and m_nums:
+            # Compare the first model number in each (e.g., "6" in "iphone 6")
+            if int(q_nums[0]) != int(m_nums[0]):
+                score = min(score, threshold - 1)  # Demote to NO_MATCH
+
     score_rounded = round(score, 2)
 
     # Determine confidence tier
@@ -252,12 +265,13 @@ def match_single_item(
     else:
         confidence = CONFIDENCE_LOW
 
-    if len(asset_ids) == 0:
+    if len(asset_ids) == 0 or confidence == CONFIDENCE_LOW:
+        # No IDs found, or score demoted below threshold by guardrail
         return {
             'mapped_uae_assetid': '',
             'match_score': score_rounded,
             'match_status': MATCH_STATUS_NO_MATCH,
-            'confidence': confidence,
+            'confidence': CONFIDENCE_LOW,
             'matched_on': best_match,
         }
     elif confidence == CONFIDENCE_HIGH:
@@ -271,7 +285,7 @@ def match_single_item(
             'matched_on': best_match,
         }
     else:
-        # 85-94%: SUGGESTED — needs human review, show best candidate but don't auto-accept
+        # 85-94%: REVIEW_REQUIRED — needs human review, do not auto-apply
         return {
             'mapped_uae_assetid': ', '.join(asset_ids),
             'match_score': score_rounded,

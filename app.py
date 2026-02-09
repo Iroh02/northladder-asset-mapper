@@ -59,7 +59,7 @@ threshold = st.sidebar.slider(
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Confidence Tiers:**")
 st.sidebar.markdown("🟢 **MATCHED** (HIGH) — Auto-apply, score >= 95%")
-st.sidebar.markdown("🟡 **SUGGESTED** (MEDIUM) — Needs review, score 85-94%")
+st.sidebar.markdown("🟡 **REVIEW REQUIRED** (MEDIUM) — Do not auto-apply, needs human review")
 st.sidebar.markdown("🔴 **NO_MATCH** (LOW) — Manual mapping, score < 85%")
 st.sidebar.markdown("🔵 **MULTIPLE_MATCHES** — Multiple IDs for same name")
 
@@ -201,7 +201,7 @@ if asset_upload is not None:
 
             ca, cb, cc, cd = st.columns(4)
             ca.metric("🟢 Matched (HIGH)", matched, f"{matched/total*100:.1f}%")
-            cb.metric("🟡 Suggested (MEDIUM)", suggested, f"{suggested/total*100:.1f}%")
+            cb.metric("🟡 Review Required", suggested, f"{suggested/total*100:.1f}%")
             cc.metric("🔵 Multiple IDs", multiple, f"{multiple/total*100:.1f}%")
             cd.metric("🔴 No Match", no_match, f"{no_match/total*100:.1f}%")
 
@@ -231,7 +231,7 @@ if asset_upload is not None:
                 # Show items needing review (SUGGESTED)
                 n_suggested = (df_result['match_status'] == MATCH_STATUS_SUGGESTED).sum()
                 if n_suggested > 0:
-                    with st.expander(f"Review {n_suggested} Suggested Matches (85-94%)"):
+                    with st.expander(f"Review {n_suggested} Items Requiring Review (85-94%)"):
                         st.dataframe(
                             df_result[df_result['match_status'] == MATCH_STATUS_SUGGESTED],
                             use_container_width=True, hide_index=True,
@@ -263,14 +263,14 @@ if asset_upload is not None:
                 no_match = int((df_result['match_status'] == MATCH_STATUS_NO_MATCH).sum())
                 summary_rows.append({
                     'Sheet': sheet_name, 'Total': total,
-                    'Matched (HIGH)': matched, 'Suggested (MEDIUM)': suggested,
+                    'Matched (HIGH)': matched, 'Review Required': suggested,
                     'Multiple IDs': multiple, 'No Match': no_match,
                     'Auto-Apply Rate': f"{matched/total*100:.2f}%",
                 })
-            summary_rows.append({'Sheet': '', 'Total': '', 'Matched (HIGH)': '', 'Suggested (MEDIUM)': '', 'Multiple IDs': '', 'No Match': '', 'Auto-Apply Rate': ''})
+            summary_rows.append({'Sheet': '', 'Total': '', 'Matched (HIGH)': '', 'Review Required': '', 'Multiple IDs': '', 'No Match': '', 'Auto-Apply Rate': ''})
             summary_rows.append({
                 'Sheet': 'NL Reference', 'Total': nl_stats['final'],
-                'Matched (HIGH)': '', 'Suggested (MEDIUM)': '', 'Multiple IDs': '', 'No Match': '',
+                'Matched (HIGH)': '', 'Review Required': '', 'Multiple IDs': '', 'No Match': '',
                 'Auto-Apply Rate': f"Auto-accept >= {HIGH_CONFIDENCE_THRESHOLD}%",
             })
             pd.DataFrame(summary_rows).to_excel(writer, sheet_name='Summary', index=False)
