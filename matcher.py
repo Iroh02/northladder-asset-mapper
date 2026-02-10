@@ -223,6 +223,12 @@ def build_brand_index(df_nl_clean: pd.DataFrame) -> Dict[str, Dict]:
     return brand_index
 
 
+def extract_storage(text: str) -> str:
+    """Extract storage from a normalized product string (e.g., '16gb', '128gb')."""
+    storage_match = re.findall(r'(\d+(?:gb|tb|mb))', text)
+    return storage_match[0] if storage_match else ''
+
+
 def extract_attributes(text: str) -> Dict[str, str]:
     """
     Extract structured attributes from a normalized product string.
@@ -233,14 +239,40 @@ def extract_attributes(text: str) -> Dict[str, str]:
 
     Used in recursive matching to filter candidates before fuzzy comparison.
     """
-    # Extract storage: "16gb", "128gb", "1tb", etc.
-    storage_match = re.findall(r'(\d+(?:gb|tb|mb))', text)
-    storage = storage_match[0] if storage_match else ''
+    storage = extract_storage(text)
+
+    # Remove connectivity markers (3g, 4g, 5g) before model number extraction
+    # to prevent "5" in "5g" from being treated as a model number
+    text_clean = re.sub(r'\b[345]g\b', '', text)
 
     # Extract model numbers: 1-2 digit numbers NOT followed by gb/tb/mb
-    model_nums = re.findall(r'(?<!\d)(\d{1,2})(?!\d|gb|tb|mb)', text)
+    model_nums = re.findall(r'(?<!\d)(\d{1,2})(?!\d|gb|tb|mb)', text_clean)
 
     return {'storage': storage, 'model_nums': model_nums}
+
+
+def extract_model_tokens(text: str) -> List[str]:
+    """
+    Extract model-identifying tokens from a normalized product string.
+
+    Returns tokens that contain digits but aren't storage (gb/tb/mb) or
+    connectivity (3g/4g/5g). Includes letter prefixes/suffixes so we can
+    distinguish variants like "5t" vs "5i" or "a57" vs "a57s".
+
+    Examples:
+        'apple iphone 14 pro 256gb' -> ['14']
+        'huawei nova 5t 128gb'      -> ['5t']
+        'oppo a57s 64gb'            -> ['a57s']
+        'samsung galaxy s23 256gb'  -> ['s23']
+        'google pixel 9 5g 256gb'   -> ['9']
+    """
+    # Remove storage tokens (e.g., "256gb", "1tb")
+    text_clean = re.sub(r'\b\d+(?:gb|tb|mb)\b', '', text)
+    # Remove connectivity markers (e.g., "5g", "4g")
+    text_clean = re.sub(r'\b[345]g\b', '', text_clean)
+    # Get remaining tokens that contain at least one digit
+    tokens = text_clean.split()
+    return [t for t in tokens if re.search(r'\d', t)]
 
 
 # ---------------------------------------------------------------------------
@@ -291,10 +323,10 @@ def match_single_item(
         search_names = brand_data['names']
 
     # --- Level 2: Storage pre-filter ---
-    query_attrs = extract_attributes(query)
-    if query_attrs['storage'] and len(search_names) > 20:
+    query_storage = extract_storage(query)
+    if query_storage and len(search_names) > 20:
         # Filter candidates to those with the same storage
-        storage_filtered = [n for n in search_names if query_attrs['storage'] in n]
+        storage_filtered = [n for n in search_names if query_storage in n]
         if storage_filtered:
             search_names = storage_filtered
 
@@ -325,13 +357,26 @@ def match_single_item(
     if not asset_ids:
         asset_ids = nl_lookup.get(best_match, [])
 
-    # --- Level 4: Model number guardrail ---
-    if score < HIGH_CONFIDENCE_THRESHOLD:
-        q_attrs = extract_attributes(query)
-        m_attrs = extract_attributes(best_match)
-        if q_attrs['model_nums'] and m_attrs['model_nums']:
-            if int(q_attrs['model_nums'][0]) != int(m_attrs['model_nums'][0]):
+    # --- Level 4: Model token guardrail ---
+    # Applied to ALL scores (including >= 95%) to prevent false positives
+    # like Pixel 9 → Pixel 3 (95%), Mate 20 → Mate 40 (95%),
+    # Nova 5T → Nova 5i (95%), A57 → A57s (96%)
+    q_tokens = extract_model_tokens(query)
+    m_tokens = extract_model_tokens(best_match)
+    if q_tokens and m_tokens:
+        # Compare model tokens position by position (e.g., "5t" vs "5i", "s23" vs "s24")
+        for qt, mt in zip(q_tokens, m_tokens):
+            if qt != mt:
                 score = min(score, threshold - 1)  # Demote to NO_MATCH
+                break
+    elif q_tokens and not m_tokens:
+        # Query has model token but match doesn't (e.g., "ROG Phone 6" → "ROG Phone")
+        # Demote to review — the match is likely a different generation
+        score = min(score, HIGH_CONFIDENCE_THRESHOLD - 1)  # Demote to REVIEW at most
+    elif not q_tokens and m_tokens:
+        # Match has model token but query doesn't (e.g., "Find X" → "Find X9")
+        # Demote to review — the match added a model number the query doesn't have
+        score = min(score, HIGH_CONFIDENCE_THRESHOLD - 1)  # Demote to REVIEW at most
 
     score_rounded = round(score, 2)
 
