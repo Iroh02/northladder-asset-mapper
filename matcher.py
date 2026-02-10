@@ -191,8 +191,60 @@ def build_nl_lookup(df_nl_clean: pd.DataFrame) -> Dict[str, List[str]]:
     return lookup
 
 
+def build_brand_index(df_nl_clean: pd.DataFrame) -> Dict[str, Dict]:
+    """
+    Build a brand-partitioned index for recursive matching.
+
+    Returns dict:  normalized_brand → {
+        'lookup': {normalized_name → [asset_ids]},
+        'names':  [list of normalized names],
+    }
+
+    This allows matching within a single brand's products instead of
+    searching all 9,894 records — faster and eliminates cross-brand errors.
+    """
+    brand_index = {}
+    for _, row in df_nl_clean.iterrows():
+        brand = normalize_text(str(row.get('brand', '')).strip())
+        if not brand:
+            continue
+        if brand not in brand_index:
+            brand_index[brand] = {'lookup': {}, 'names': []}
+
+        name = row['normalized_name']
+        asset_id = str(row['uae_assetid']).strip()
+
+        if name not in brand_index[brand]['lookup']:
+            brand_index[brand]['lookup'][name] = []
+            brand_index[brand]['names'].append(name)
+        if asset_id not in brand_index[brand]['lookup'][name]:
+            brand_index[brand]['lookup'][name].append(asset_id)
+
+    return brand_index
+
+
+def extract_attributes(text: str) -> Dict[str, str]:
+    """
+    Extract structured attributes from a normalized product string.
+
+    Returns dict with:
+        'storage': e.g., '16gb', '128gb', '1tb' (or '' if not found)
+        'model_nums': list of model numbers (short digits not attached to storage)
+
+    Used in recursive matching to filter candidates before fuzzy comparison.
+    """
+    # Extract storage: "16gb", "128gb", "1tb", etc.
+    storage_match = re.findall(r'(\d+(?:gb|tb|mb))', text)
+    storage = storage_match[0] if storage_match else ''
+
+    # Extract model numbers: 1-2 digit numbers NOT followed by gb/tb/mb
+    model_nums = re.findall(r'(?<!\d)(\d{1,2})(?!\d|gb|tb|mb)', text)
+
+    return {'storage': storage, 'model_nums': model_nums}
+
+
 # ---------------------------------------------------------------------------
-# Matching logic
+# Matching logic — recursive brand → attribute → fuzzy
 # ---------------------------------------------------------------------------
 
 def match_single_item(
@@ -200,59 +252,85 @@ def match_single_item(
     nl_lookup: Dict[str, List[str]],
     nl_names: List[str],
     threshold: int = SIMILARITY_THRESHOLD,
+    brand_index: Optional[Dict] = None,
+    input_brand: str = '',
 ) -> dict:
     """
-    Match a single normalized query string against the NL list.
+    Match a single product against the NL list using recursive narrowing.
 
-    Returns dict with:
-        - mapped_uae_assetid: matched ID(s) or empty string
-        - match_score: best similarity score (0-100)
-        - match_status: MATCHED / MULTIPLE_MATCHES / NO_MATCH
-        - matched_on: the normalized NL name that was matched (for explainability)
+    Matching strategy (cascading filters):
+        1. BRAND FILTER: If brand is known, search only within that brand's products
+           (e.g., 9,894 → ~2,000 Apple records). Eliminates cross-brand errors.
+        2. STORAGE FILTER: If storage is detected (e.g., "16gb"), prefer candidates
+           with the same storage. Prevents "16GB" matching "128GB" variants.
+        3. FUZZY MATCH: token_sort_ratio on the narrowed candidate list.
+        4. MODEL NUMBER GUARD: Reject if model numbers differ (e.g., iPhone 4 vs 6).
 
-    Uses token_sort_ratio which:
-        - Splits strings into tokens, sorts them, then compares
-        - This handles word-order differences well
-        - "apple iphone 6 16gb" matches "iphone 6 16gb apple" equally
+    Falls back to full NL search if brand filtering yields no results.
     """
-    if not query:
-        return {
-            'mapped_uae_assetid': '',
-            'match_score': 0,
-            'match_status': MATCH_STATUS_NO_MATCH,
-            'confidence': CONFIDENCE_LOW,
-            'matched_on': '',
-        }
+    no_match_result = {
+        'mapped_uae_assetid': '',
+        'match_score': 0,
+        'match_status': MATCH_STATUS_NO_MATCH,
+        'confidence': CONFIDENCE_LOW,
+        'matched_on': '',
+    }
 
-    # Find the best match using token_sort_ratio
+    if not query:
+        return no_match_result
+
+    # --- Level 1: Brand partitioning ---
+    search_lookup = nl_lookup
+    search_names = nl_names
+    brand_norm = normalize_text(input_brand) if input_brand else ''
+
+    if brand_index and brand_norm and brand_norm in brand_index:
+        # Narrow search to this brand's products only
+        brand_data = brand_index[brand_norm]
+        search_lookup = brand_data['lookup']
+        search_names = brand_data['names']
+
+    # --- Level 2: Storage pre-filter ---
+    query_attrs = extract_attributes(query)
+    if query_attrs['storage'] and len(search_names) > 20:
+        # Filter candidates to those with the same storage
+        storage_filtered = [n for n in search_names if query_attrs['storage'] in n]
+        if storage_filtered:
+            search_names = storage_filtered
+
+    # --- Level 3: Fuzzy match on narrowed candidates ---
     result = process.extractOne(
         query,
-        nl_names,
+        search_names,
         scorer=fuzz.token_sort_ratio,
         score_cutoff=threshold,
     )
 
+    # If brand-filtered search found nothing, fall back to full NL search
+    if result is None and (search_names is not nl_names):
+        result = process.extractOne(
+            query,
+            nl_names,
+            scorer=fuzz.token_sort_ratio,
+            score_cutoff=threshold,
+        )
+        search_lookup = nl_lookup  # use full lookup for ID resolution
+
     if result is None:
-        return {
-            'mapped_uae_assetid': '',
-            'match_score': 0,
-            'match_status': MATCH_STATUS_NO_MATCH,
-            'confidence': CONFIDENCE_LOW,
-            'matched_on': '',
-        }
+        return no_match_result
 
     best_match, score, _ = result
-    asset_ids = nl_lookup.get(best_match, [])
+    asset_ids = search_lookup.get(best_match, [])
+    # Also check full lookup in case brand subset didn't have the ID mapping
+    if not asset_ids:
+        asset_ids = nl_lookup.get(best_match, [])
 
-    # Numeric proximity guardrail: catch model number mismatches
-    # e.g., "iPhone 4" vs "iPhone 11" score 87% on token_sort but are wrong products
-    # Extract short model numbers (1-2 digits, not storage like 128gb) and penalize
+    # --- Level 4: Model number guardrail ---
     if score < HIGH_CONFIDENCE_THRESHOLD:
-        q_nums = re.findall(r'(?<!\d)(\d{1,2})(?!\d|gb|tb|mb)', query)
-        m_nums = re.findall(r'(?<!\d)(\d{1,2})(?!\d|gb|tb|mb)', best_match)
-        if q_nums and m_nums:
-            # Compare the first model number in each (e.g., "6" in "iphone 6")
-            if int(q_nums[0]) != int(m_nums[0]):
+        q_attrs = extract_attributes(query)
+        m_attrs = extract_attributes(best_match)
+        if q_attrs['model_nums'] and m_attrs['model_nums']:
+            if int(q_attrs['model_nums'][0]) != int(m_attrs['model_nums'][0]):
                 score = min(score, threshold - 1)  # Demote to NO_MATCH
 
     score_rounded = round(score, 2)
@@ -266,7 +344,6 @@ def match_single_item(
         confidence = CONFIDENCE_LOW
 
     if len(asset_ids) == 0 or confidence == CONFIDENCE_LOW:
-        # No IDs found, or score demoted below threshold by guardrail
         return {
             'mapped_uae_assetid': '',
             'match_score': score_rounded,
@@ -275,7 +352,6 @@ def match_single_item(
             'matched_on': best_match,
         }
     elif confidence == CONFIDENCE_HIGH:
-        # >= 95%: safe to auto-apply
         status = MATCH_STATUS_MULTIPLE if len(asset_ids) > 1 else MATCH_STATUS_MATCHED
         return {
             'mapped_uae_assetid': ', '.join(asset_ids),
@@ -285,7 +361,6 @@ def match_single_item(
             'matched_on': best_match,
         }
     else:
-        # 85-94%: REVIEW_REQUIRED — needs human review, do not auto-apply
         return {
             'mapped_uae_assetid': ', '.join(asset_ids),
             'match_score': score_rounded,
@@ -303,33 +378,43 @@ def run_matching(
     nl_names: List[str],
     threshold: int = SIMILARITY_THRESHOLD,
     progress_callback: Optional[Callable] = None,
+    brand_index: Optional[Dict] = None,
 ) -> pd.DataFrame:
     """
-    Run fuzzy matching for an entire input DataFrame against the NL lookup.
+    Run recursive matching for an entire input DataFrame against the NL lookup.
+
+    Matching is recursive (cascading filters):
+        1. Brand partition → narrows search to one brand
+        2. Storage filter → narrows to same storage variant
+        3. Fuzzy match → finds best candidate
+        4. Model number guard → rejects wrong model numbers
 
     Args:
         df_input: The input asset list (List 1 or List 2)
         brand_col: Column name containing the brand/manufacturer
         name_col: Column name containing the product name
-        nl_lookup: dict of normalized_name → [asset_ids]
-        nl_names: list of all normalized NL names (for rapidfuzz)
+        nl_lookup: dict of normalized_name → [asset_ids] (full, for fallback)
+        nl_names: list of all normalized NL names (full, for fallback)
         threshold: minimum similarity score
         progress_callback: optional callable(current, total) for UI progress
+        brand_index: brand-partitioned index from build_brand_index()
 
     Returns:
         Copy of df_input with added columns:
-            mapped_uae_assetid, match_score, match_status, matched_on
+            mapped_uae_assetid, match_score, match_status, confidence, matched_on
     """
     df = df_input.copy()
     total = len(df)
 
     results = []
     for idx, row in df.iterrows():
-        query = build_match_string(
-            row.get(brand_col, ''),
-            row.get(name_col, ''),
+        input_brand = str(row.get(brand_col, '')).strip() if brand_col != '__no_brand__' else ''
+        query = build_match_string(input_brand, row.get(name_col, ''))
+        match_result = match_single_item(
+            query, nl_lookup, nl_names, threshold,
+            brand_index=brand_index,
+            input_brand=input_brand,
         )
-        match_result = match_single_item(query, nl_lookup, nl_names, threshold)
         results.append(match_result)
 
         if progress_callback and (len(results) % 50 == 0 or len(results) == total):
@@ -355,6 +440,7 @@ def test_single_match(
     nl_lookup: Dict[str, List[str]],
     nl_names: List[str],
     threshold: int = SIMILARITY_THRESHOLD,
+    brand_index: Optional[Dict] = None,
 ) -> dict:
     """
     Test matching for a single item. Returns detailed info including top 3 alternatives.
@@ -369,17 +455,25 @@ def test_single_match(
             'top_matches': [],
         }
 
-    # Get top 3 matches
+    # Determine search scope (brand-partitioned if available)
+    search_names = nl_names
+    search_lookup = nl_lookup
+    brand_norm = normalize_text(brand) if brand else ''
+    if brand_index and brand_norm and brand_norm in brand_index:
+        search_names = brand_index[brand_norm]['names']
+        search_lookup = brand_index[brand_norm]['lookup']
+
+    # Get top 3 matches from the brand-scoped search
     top_matches = process.extract(
         query,
-        nl_names,
+        search_names,
         scorer=fuzz.token_sort_ratio,
         limit=3,
     )
 
     alternatives = []
     for match_name, score, _ in top_matches:
-        asset_ids = nl_lookup.get(match_name, [])
+        asset_ids = search_lookup.get(match_name, []) or nl_lookup.get(match_name, [])
         if score >= HIGH_CONFIDENCE_THRESHOLD:
             alt_status = 'HIGH'
         elif score >= threshold:
@@ -393,7 +487,8 @@ def test_single_match(
             'status': alt_status,
         })
 
-    best = match_single_item(query, nl_lookup, nl_names, threshold)
+    best = match_single_item(query, nl_lookup, nl_names, threshold,
+                             brand_index=brand_index, input_brand=brand)
 
     return {
         'query': query,
