@@ -371,54 +371,59 @@ def extract_product_attributes(text: str, brand: str = '') -> Dict[str, str]:
         text_norm = re.sub(r'\s+', ' ', text_clean).strip()
 
     # Apple iPhone: "iphone 14 pro 256gb" → line=iphone, model=14 pro
+    # CRITICAL: Capture ALL variant words (pro max, pro, plus, mini, etc.)
     if 'iphone' in text_norm:
-        match = re.search(r'iphone\s+(\d+[a-z]*(?:\s+\w+)?)', text_norm)
+        match = re.search(r'iphone\s+(\d+[a-z]*(?:\s+(?:pro|plus|max|mini|ultra|lite))*)', text_norm)
         if match:
             attrs['product_line'] = 'iphone'
             attrs['model'] = match.group(1).strip()
             return attrs
 
     # Samsung Galaxy: "galaxy s9 plus 128gb" → line=galaxy, model=s9 plus
+    # CRITICAL: Capture ALL variant words (plus, ultra, note, fold, flip, etc.)
     if 'galaxy' in text_norm:
-        match = re.search(r'galaxy\s+([a-z]+\d+[a-z]*(?:\s+\w+)?)', text_norm)
+        match = re.search(r'galaxy\s+([a-z]+\d+[a-z]*(?:\s+(?:pro|plus|max|ultra|lite|note|fold|flip|edge|active))*)', text_norm)
         if match:
             attrs['product_line'] = 'galaxy'
             attrs['model'] = match.group(1).strip()
             return attrs
 
     # Google Pixel: "pixel 9 pro 256gb" → line=pixel, model=9 pro
+    # CRITICAL: Capture ALL variant words (pro xl, pro, a, etc.)
     if 'pixel' in text_norm:
-        match = re.search(r'pixel\s+(\d+[a-z]*(?:\s+\w+)?)', text_norm)
+        match = re.search(r'pixel\s+(\d+[a-z]*(?:\s+(?:pro|xl|max|ultra|lite|a))*)', text_norm)
         if match:
             attrs['product_line'] = 'pixel'
             attrs['model'] = match.group(1).strip()
             return attrs
 
     # Xiaomi Redmi/Mi: "redmi note 12 pro 128gb" → line=redmi, model=note 12 pro
+    # CRITICAL: Capture ALL variant words (pro max, pro, plus, etc.)
     if 'redmi' in text_norm:
-        match = re.search(r'redmi\s+(note\s+\d+[a-z]*(?:\s+\w+)?|\d+[a-z]*(?:\s+\w+)?)', text_norm, re.IGNORECASE)
+        match = re.search(r'redmi\s+(note\s+\d+[a-z]*(?:\s+(?:pro|plus|max|ultra|lite))*|\d+[a-z]*(?:\s+(?:pro|plus|max|ultra|lite))*)', text_norm, re.IGNORECASE)
         if match:
             attrs['product_line'] = 'redmi'
             attrs['model'] = match.group(1).strip()
             return attrs
     elif 'xiaomi' in brand_norm and 'mi' in text_norm:
         # "xiaomi mi 11 ultra" → line=mi, model=11 ultra
-        match = re.search(r'mi\s+(\d+[a-z]*(?:\s+\w+)?)', text_norm)
+        match = re.search(r'mi\s+(\d+[a-z]*(?:\s+(?:pro|plus|max|ultra|lite))*)', text_norm)
         if match:
             attrs['product_line'] = 'mi'
             attrs['model'] = match.group(1).strip()
             return attrs
 
     # Huawei Mate/P-series: "mate 30 pro 256gb" → line=mate, model=30 pro
+    # CRITICAL: Capture ALL variant words
     if 'mate' in text_norm and ('huawei' in brand_norm or 'huawei' in text_norm):
-        match = re.search(r'mate\s+(\d+[a-z]*(?:\s+\w+)?)', text_norm)
+        match = re.search(r'mate\s+(\d+[a-z]*(?:\s+(?:pro|plus|max|ultra|lite))*)', text_norm)
         if match:
             attrs['product_line'] = 'mate'
             attrs['model'] = match.group(1).strip()
             return attrs
     elif ('huawei' in brand_norm or 'huawei' in text_norm) and re.search(r'\bp\d+', text_norm):
         # "huawei p30 pro" → line=p, model=30 pro
-        match = re.search(r'p(\d+[a-z]*(?:\s+\w+)?)', text_norm)
+        match = re.search(r'p(\d+[a-z]*(?:\s+(?:pro|plus|max|ultra|lite))*)', text_norm)
         if match:
             attrs['product_line'] = 'p'
             attrs['model'] = match.group(1).strip()
@@ -426,9 +431,10 @@ def extract_product_attributes(text: str, brand: str = '') -> Dict[str, str]:
 
     # === GENERIC EXTRACTION (all other brands) ===
     # Detect common product line patterns: "find x5", "moto g50", "reno 8", etc.
+    # CRITICAL: Capture ALL variant words (pro max, plus, etc.)
 
     # Pattern 1: "ProductLine ModelNumber" (e.g., "find x5", "reno 8 pro")
-    match = re.search(r'\b([a-z]+)\s+([a-z]?\d+[a-z]*(?:\s+(?:pro|plus|ultra|lite|max|mini|note))?)', text_norm, re.IGNORECASE)
+    match = re.search(r'\b([a-z]+)\s+([a-z]?\d+[a-z]*(?:\s+(?:pro|plus|ultra|lite|max|mini|note|xl|edge|active))*)', text_norm, re.IGNORECASE)
     if match:
         line_candidate = match.group(1)
         model_candidate = match.group(2)
@@ -441,7 +447,7 @@ def extract_product_attributes(text: str, brand: str = '') -> Dict[str, str]:
             return attrs
 
     # Pattern 2: Just model number (e.g., "a52 5g 128gb")
-    match = re.search(r'\b([a-z]?\d+[a-z]*(?:\s+(?:pro|plus|ultra|lite|max|mini))?)', text_norm, re.IGNORECASE)
+    match = re.search(r'\b([a-z]?\d+[a-z]*(?:\s+(?:pro|plus|ultra|lite|max|mini|xl))*)', text_norm, re.IGNORECASE)
     if match:
         model_candidate = match.group(1).strip()
         # Use first meaningful word as product line
