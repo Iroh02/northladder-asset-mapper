@@ -54,24 +54,27 @@ def normalize_text(text: str) -> str:
 
     Steps:
         1. Lowercase
-        2. Remove year patterns like (2014), (2015) — these are NL-specific metadata
+        2. Keep year patterns (2014), (2015) - years are critical for distinguishing products
+           (e.g., iPhone SE 2016 vs 2020 vs 2022 are different products)
         3. Remove punctuation (commas, quotes, dashes become spaces)
         4. Standardize storage: "16 gb" → "16gb", "512 gb" → "512gb"
         5. Standardize RAM: "8 gb ram" → "8gb"
         6. Collapse whitespace
 
-    Safety note: We intentionally keep all numeric tokens (storage sizes, model numbers)
-    since they are critical differentiators (e.g., iPhone 6 16GB vs 128GB).
+    Safety note: We intentionally keep all numeric tokens (storage sizes, model numbers, YEARS)
+    since they are critical differentiators (e.g., iPhone 6 16GB vs 128GB, iPhone SE 2016 vs 2020).
     """
     if not isinstance(text, str):
         return ""
 
     s = text.lower().strip()
 
-    # Remove year patterns like (2014), (2015)
-    s = re.sub(r'\(\d{4}\)', '', s)
+    # KEEP years - they're critical for distinguishing products
+    # iPhone SE (2016) vs (2020) vs (2022) are DIFFERENT products
+    # Years will be preserved as numbers after punctuation removal
 
     # Remove common punctuation — replace with space to preserve token boundaries
+    # This converts "(2016)" to " 2016 " which keeps the year
     s = re.sub(r'[,\-\(\)"\'\/\.]', ' ', s)
 
     # Standardize storage/RAM: "16 gb" → "16gb", handles TB/MB too
