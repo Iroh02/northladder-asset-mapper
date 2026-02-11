@@ -1118,6 +1118,64 @@ def _is_nl_sheet(sheet_name: str) -> bool:
     return any(kw in name_lower for kw in NL_SHEET_KEYWORDS)
 
 
+def _filter_duplicate_custom_configs(df: pd.DataFrame, name_col: str) -> pd.DataFrame:
+    """
+    Smart filter: Remove "Custom configuration" items ONLY if a specific config also exists.
+
+    Keeps unique custom configs (might be real custom-built products).
+    Removes duplicate custom configs (obvious placeholders).
+
+    Example:
+      Remove: "Acer Nitro V - Custom configuration" (duplicate exists below)
+      Keep:   "Acer Nitro V - Core i5 / 16GB / 512GB" (specific config)
+      Keep:   "HP Laptop X - Custom configuration" (if NO specific config exists)
+
+    Returns: DataFrame with duplicate custom configs filtered out
+    """
+    if name_col not in df.columns:
+        return df
+
+    # Find all custom config items
+    custom_mask = df[name_col].str.contains('custom configuration', case=False, na=False)
+    custom_items = df[custom_mask]
+
+    if len(custom_items) == 0:
+        return df  # No custom configs, return as-is
+
+    # Check each custom config item for duplicates
+    keep_indices = []
+
+    for idx in df.index:
+        if not custom_mask[idx]:
+            keep_indices.append(idx)  # Not a custom config, keep it
+            continue
+
+        # It's a custom config - check if a specific config exists for same model
+        name = str(df.loc[idx, name_col])
+
+        # Extract model base (everything before "- Custom configuration")
+        if ' - custom' in name.lower():
+            model_base = name.split(' - Custom')[0].strip()
+        elif ' - CUSTOM' in name:
+            model_base = name.split(' - CUSTOM')[0].strip()
+        else:
+            model_base = name.replace('custom configuration', '').replace('Custom Configuration', '').strip()
+
+        # Find items with same model base but specific config (not custom)
+        duplicates = df[
+            (df[name_col].str.contains(model_base, regex=False, na=False, case=False)) &
+            (~df[name_col].str.contains('custom configuration', case=False, na=False)) &
+            (df.index != idx)
+        ]
+
+        if len(duplicates) == 0:
+            # No duplicate found - this is a unique custom config, keep it
+            keep_indices.append(idx)
+        # else: Duplicate exists, don't add to keep_indices (filter it out)
+
+    return df.loc[keep_indices].reset_index(drop=True)
+
+
 def parse_asset_sheets(file) -> Dict[str, Dict]:
     """
     Parse all asset-list sheets from an uploaded Excel file.
@@ -1173,6 +1231,10 @@ def parse_asset_sheets(file) -> Dict[str, Dict]:
 
         # Drop rows where the name column is empty
         df = df.dropna(subset=[col_map['name_col']])
+
+        # Smart filter: Remove duplicate "Custom configuration" entries
+        # Keeps unique custom configs, removes obvious placeholders
+        df = _filter_duplicate_custom_configs(df, col_map['name_col'])
 
         results[sheet_name] = {
             'df': df.reset_index(drop=True),
