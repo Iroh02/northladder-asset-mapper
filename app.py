@@ -16,6 +16,7 @@ from matcher import (
     load_and_clean_nl_list,
     build_nl_lookup,
     build_brand_index,
+    build_attribute_index,
     run_matching,
     test_single_match,
     parse_nl_sheet,
@@ -100,10 +101,11 @@ df_nl_clean, nl_stats = load_nl_reference()
 nl_lookup = build_nl_lookup(df_nl_clean)
 nl_names = list(nl_lookup.keys())
 nl_brand_index = build_brand_index(df_nl_clean)
+nl_attribute_index = build_attribute_index(df_nl_clean)
 
 st.success(
     f"NL Reference: **{nl_stats['final']:,}** asset records loaded "
-    f"({len(nl_brand_index)} brands)"
+    f"({len(nl_brand_index)} brands, hybrid matching enabled)"
 )
 
 # =========================================================================
@@ -155,7 +157,8 @@ if asset_upload is not None:
         test_btn = st.button("Test Match", use_container_width=True)
 
     if test_btn:
-        result = test_single_match(test_brand, test_name, nl_lookup, nl_names, threshold, brand_index=nl_brand_index)
+        result = test_single_match(test_brand, test_name, nl_lookup, nl_names, threshold,
+                                   brand_index=nl_brand_index, attribute_index=nl_attribute_index)
         st.markdown(f"**Query:** `{result['query']}`")
         if 'error' in result:
             st.error(result['error'])
@@ -195,6 +198,7 @@ if asset_upload is not None:
                 threshold=threshold,
                 progress_callback=make_progress_cb(progress, sheet_name),
                 brand_index=nl_brand_index,
+                attribute_index=nl_attribute_index,
             )
             progress.progress(1.0, text=f"✅ {sheet_name} complete!")
             all_results[sheet_name] = df_result
