@@ -32,9 +32,9 @@ from typing import Dict, List, Callable, Optional, Tuple
 # Constants
 # ---------------------------------------------------------------------------
 SIMILARITY_THRESHOLD = 85   # Minimum score to appear as a candidate at all
-HIGH_CONFIDENCE_THRESHOLD = 95  # Auto-accept: safe to apply without review
+HIGH_CONFIDENCE_THRESHOLD = 90  # Auto-accept: safe to apply without review (lowered from 95)
 
-MATCH_STATUS_MATCHED = "MATCHED"           # >= 95% single ID — auto-apply
+MATCH_STATUS_MATCHED = "MATCHED"           # >= 90% single ID — auto-apply
 MATCH_STATUS_MULTIPLE = "MULTIPLE_MATCHES" # >= 95% but multiple IDs for same name
 MATCH_STATUS_SUGGESTED = "REVIEW_REQUIRED"  # 85-94% — needs human review
 MATCH_STATUS_NO_MATCH = "NO_MATCH"         # < 85% — manual mapping required
@@ -80,6 +80,11 @@ def normalize_text(text: str) -> str:
     # Remove screen size patterns like 15.6" or 10.1" (inches)
     # These are mostly in List 2 laptop names and rarely in NL
     s = re.sub(r'\d+\.?\d*\s*"', '', s)
+
+    # Strip connectivity markers (5G, 4G, 3G, LTE) - causes score drops
+    # Example: "ROG Phone 3 5G" should match "ROG Phone 3" at 100%
+    s = re.sub(r'\b[345]g\b', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\blte\b', '', s, flags=re.IGNORECASE)
 
     # Collapse whitespace
     s = re.sub(r'\s+', ' ', s).strip()
