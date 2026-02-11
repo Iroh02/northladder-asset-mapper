@@ -1,7 +1,5 @@
 {
-  "original": 10966,
-  "null_dropped": 1071,
-  "test_dropped": 1,
-  "final": 9894,
-  "warnings": []
+  "total_products": 10966,
+  "unique_normalized": 9780,
+  "duplicates": 1186
 }
