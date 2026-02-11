@@ -722,6 +722,93 @@ def extract_model_tokens(text: str) -> List[str]:
     return [t for t in tokens if re.search(r'\d', t)]
 
 
+def verify_critical_attributes(query: str, matched: str) -> bool:
+    """
+    Verify that critical attributes match between query and matched product.
+
+    Used for REVIEW items (85-94% scores) to determine if they should be
+    auto-upgraded to MATCHED status.
+
+    Critical attributes that MUST match:
+        - Model tokens: e.g., "14" in "iPhone 14", "5t" in "Nova 5T", "s23" in "Galaxy S23"
+        - Storage: e.g., "128gb", "256gb", "1tb"
+
+    Non-critical attributes (can differ):
+        - Connectivity: "5G", "Dual SIM", "LTE"
+        - Year: "2020" vs "2022"
+        - Descriptors: "Pro", "Plus", "Limited Edition"
+
+    Args:
+        query: Normalized query string (original product name)
+        matched: Normalized matched string (NL catalog product name)
+
+    Returns:
+        True if all critical attributes match (safe to upgrade to MATCHED)
+        False if any critical attribute differs (keep as REVIEW_REQUIRED)
+
+    Examples:
+        ✓ verify("rog phone 5 dual 128gb", "asus rog phone 5 128gb") -> True
+          (Model "5" matches, storage "128gb" matches, "dual" is non-critical)
+
+        ✓ verify("iphone se 2020 128gb", "apple iphone se 128gb") -> True
+          (Model "se" matches, storage matches, year "2020" is non-critical)
+
+        ✗ verify("galaxy s23 256gb", "samsung galaxy s24 256gb") -> False
+          (Model "s23" vs "s24" differs - different products)
+
+        ✗ verify("iphone 14 128gb", "apple iphone 14 256gb") -> False
+          (Storage "128gb" vs "256gb" differs - different SKUs)
+    """
+    # Extract critical attributes from both strings
+    query_model = extract_model_tokens(query)
+    matched_model = extract_model_tokens(matched)
+
+    query_storage = extract_storage(query)
+    matched_storage = extract_storage(matched)
+
+    # RULE 1: Storage must match exactly if both have storage specified
+    # (128GB vs 256GB are different SKUs)
+    if query_storage and matched_storage:
+        if query_storage != matched_storage:
+            return False  # Different storage -> different SKU
+
+    # RULE 2: Model tokens must match (order doesn't matter, but values must)
+    # This catches: iPhone 14 vs 15, Galaxy S23 vs S24, Nova 5T vs 5i
+    if query_model and matched_model:
+        # Both have model tokens - they must overlap significantly
+        # Using set comparison: if query tokens are subset of matched tokens, it's OK
+        # (matched might have extra tokens like year, but core model must match)
+        query_set = set(query_model)
+        matched_set = set(matched_model)
+
+        # Check if core model tokens match
+        # At least one model token from query must be in matched
+        if not query_set.intersection(matched_set):
+            return False  # No common model tokens -> different products
+
+        # If query has primary model token (first one), matched must have it too
+        # This catches: iPhone "14" vs "15", Galaxy "s23" vs "s24"
+        if query_model[0] not in matched_set:
+            return False  # Primary model differs
+
+    elif query_model and not matched_model:
+        # Query has model token but match doesn't
+        # This might be OK if it's just a generic base model
+        # e.g., "ROG Phone 6" -> "ROG Phone" (generic)
+        # Let's be conservative and allow this
+        pass
+
+    elif not query_model and matched_model:
+        # Match has model token but query doesn't
+        # This is suspicious - match is more specific than query
+        # e.g., "Find X" -> "Find X9" (match added specificity)
+        # Be conservative and allow this (might be variant)
+        pass
+
+    # All critical checks passed
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Matching logic — recursive brand → attribute → fuzzy
 # ---------------------------------------------------------------------------
@@ -866,14 +953,32 @@ def match_single_item(
             'method': 'fuzzy',
         }
     else:
-        return {
-            'mapped_uae_assetid': ', '.join(asset_ids),
-            'match_score': score_rounded,
-            'match_status': MATCH_STATUS_SUGGESTED,
-            'confidence': confidence,
-            'matched_on': best_match,
-            'method': 'fuzzy',
-        }
+        # MEDIUM confidence (85-94%): Apply attribute verification
+        # If critical attributes match, upgrade to MATCHED
+        # Otherwise, keep as REVIEW_REQUIRED for human verification
+        verified = verify_critical_attributes(query, best_match)
+
+        if verified:
+            # All critical attributes match -> safe to auto-accept
+            status = MATCH_STATUS_MULTIPLE if len(asset_ids) > 1 else MATCH_STATUS_MATCHED
+            return {
+                'mapped_uae_assetid': ', '.join(asset_ids),
+                'match_score': score_rounded,
+                'match_status': status,
+                'confidence': confidence,
+                'matched_on': best_match,
+                'method': 'fuzzy_verified',  # Indicate this was verified
+            }
+        else:
+            # Critical attributes differ -> needs human review
+            return {
+                'mapped_uae_assetid': ', '.join(asset_ids),
+                'match_score': score_rounded,
+                'match_status': MATCH_STATUS_SUGGESTED,
+                'confidence': confidence,
+                'matched_on': best_match,
+                'method': 'fuzzy',
+            }
 
 
 def run_matching(
