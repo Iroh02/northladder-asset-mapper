@@ -74,6 +74,7 @@ with st.sidebar.expander("Admin: NL Reference"):
             st.caption(f"Loaded {nl_meta['final']:,} records")
         if st.button("Refresh NL Reference"):
             delete_nl_reference()
+            st.cache_data.clear()  # Clear cache to reload catalog
             st.rerun()
     else:
         st.warning("No NL reference found")
@@ -85,23 +86,51 @@ with st.sidebar.expander("Admin: NL Reference"):
                 df_clean, stats = load_and_clean_nl_list(df_raw)
                 save_nl_reference(df_clean, stats)
             st.success(f"Saved {stats['final']:,} records")
+            st.cache_data.clear()  # Clear cache to reload new catalog
             st.rerun()
 
 # =========================================================================
-# Load NL reference (bundled with app)
+# Load NL reference (bundled with app) - CACHED for performance
 # =========================================================================
-if not nl_reference_exists():
+
+@st.cache_data(show_spinner="Loading NL catalog...")
+def load_nl_catalog():
+    """Load NL reference and build all indexes - cached for fast reloads."""
+    if not nl_reference_exists():
+        return None
+
+    df_nl_clean, nl_stats = load_nl_reference()
+    nl_lookup = build_nl_lookup(df_nl_clean)
+    nl_names = list(nl_lookup.keys())
+    nl_brand_index = build_brand_index(df_nl_clean)
+    nl_attribute_index = build_attribute_index(df_nl_clean)
+
+    return {
+        'df': df_nl_clean,
+        'stats': nl_stats,
+        'lookup': nl_lookup,
+        'names': nl_names,
+        'brand_index': nl_brand_index,
+        'attribute_index': nl_attribute_index,
+    }
+
+# Load catalog (will be cached after first load)
+catalog = load_nl_catalog()
+
+if catalog is None:
     st.error(
         "NL reference catalog not found. "
         "Use the Admin panel in the sidebar to upload the NorthLadder master Excel."
     )
     st.stop()
 
-df_nl_clean, nl_stats = load_nl_reference()
-nl_lookup = build_nl_lookup(df_nl_clean)
-nl_names = list(nl_lookup.keys())
-nl_brand_index = build_brand_index(df_nl_clean)
-nl_attribute_index = build_attribute_index(df_nl_clean)
+# Unpack cached data
+df_nl_clean = catalog['df']
+nl_stats = catalog['stats']
+nl_lookup = catalog['lookup']
+nl_names = catalog['names']
+nl_brand_index = catalog['brand_index']
+nl_attribute_index = catalog['attribute_index']
 
 st.success(
     f"NL Reference: **{nl_stats['final']:,}** asset records loaded "
