@@ -953,14 +953,20 @@ def match_single_item(
     # Applied to ALL scores (including >= 95%) to prevent false positives
     # like Pixel 9 → Pixel 3 (95%), Mate 20 → Mate 40 (95%),
     # Nova 5T → Nova 5i (95%), A57 → A57s (96%)
+    # Pro vs Pro Max (different products!), Plus variants, XL variants
     q_tokens = extract_model_tokens(query)
     m_tokens = extract_model_tokens(best_match)
     if q_tokens and m_tokens:
-        # Compare model tokens position by position (e.g., "5t" vs "5i", "s23" vs "s24")
-        for qt, mt in zip(q_tokens, m_tokens):
-            if qt != mt:
-                score = min(score, threshold - 1)  # Demote to NO_MATCH
-                break
+        # CRITICAL: First check if token counts differ (catches Pro vs Pro Max!)
+        # zip() only compares overlapping tokens, so we'd miss the 'max' difference
+        if len(q_tokens) != len(m_tokens):
+            score = min(score, threshold - 1)  # Demote to NO_MATCH
+        else:
+            # Same count → compare position by position (e.g., "5t" vs "5i", "s23" vs "s24")
+            for qt, mt in zip(q_tokens, m_tokens):
+                if qt != mt:
+                    score = min(score, threshold - 1)  # Demote to NO_MATCH
+                    break
     elif q_tokens and not m_tokens:
         # Query has model token but match doesn't (e.g., "ROG Phone 6" → "ROG Phone")
         # Demote to review — the match is likely a different generation
