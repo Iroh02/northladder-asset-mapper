@@ -50,19 +50,29 @@ CONFIDENCE_LOW = "LOW"        # < 85%
 
 def normalize_text(text: str) -> str:
     """
-    Normalize an asset name for comparison.
+    Normalize an asset name for comparison with enhanced variant preservation.
 
     Steps:
         1. Lowercase
-        2. Keep year patterns (2014), (2015) - years are critical for distinguishing products
-           (e.g., iPhone SE 2016 vs 2020 vs 2022 are different products)
-        3. Remove punctuation (commas, quotes, dashes become spaces)
-        4. Standardize storage: "16 gb" → "16gb", "512 gb" → "512gb"
-        5. Standardize RAM: "8 gb ram" → "8gb"
-        6. Collapse whitespace
+        2. Keep year patterns (2014), (2015) - different years = different products
+        3. Keep variant identifiers (Max, Plus, XL, Pro, etc.) - critical differentiators
+        4. Keep letter suffixes on models (7X vs 7C) - different variants
+        5. Keep product type keywords (Tab, Watch, Fold) - different categories
+        6. Remove punctuation (commas, quotes, dashes become spaces)
+        7. Standardize storage/RAM: "16 gb" → "16gb"
+        8. Remove connectivity markers (5G/LTE) - not product differentiators
+        9. Collapse whitespace
 
-    Safety note: We intentionally keep all numeric tokens (storage sizes, model numbers, YEARS)
-    since they are critical differentiators (e.g., iPhone 6 16GB vs 128GB, iPhone SE 2016 vs 2020).
+    Variant preservation prevents false MULTIPLE_MATCHES:
+    - iPhone 11 Pro vs Pro Max → different normalized names (different products!)
+    - Honor 7 vs 7X → different normalized names (different models!)
+    - Galaxy Tab vs Watch → different normalized names (different categories!)
+
+    Safety note: We intentionally keep:
+    - All numeric tokens (storage, RAM, model numbers, years)
+    - Variant suffixes (Max, Plus, XL, Pro)
+    - Letter model variants (X, C, S after numbers)
+    - Product type keywords
     """
     if not isinstance(text, str):
         return ""
@@ -78,16 +88,23 @@ def normalize_text(text: str) -> str:
     s = re.sub(r'[,\-\(\)"\'\/\.]', ' ', s)
 
     # Standardize storage/RAM: "16 gb" → "16gb", handles TB/MB too
+    # This keeps RAM values distinct: "2gb" vs "3gb" vs "4gb"
     s = re.sub(r'(\d+)\s*(gb|tb|mb)', r'\1\2', s, flags=re.IGNORECASE)
 
     # Remove screen size patterns like 15.6" or 10.1" (inches)
     # These are mostly in List 2 laptop names and rarely in NL
     s = re.sub(r'\d+\.?\d*\s*"', '', s)
 
-    # Strip connectivity markers (5G, 4G, 3G, LTE) - causes score drops
+    # Strip connectivity markers (5G, 4G, 3G, LTE) - these are NOT product differentiators
+    # Z Fold2 5G vs Z Fold2 LTE are SAME base product (just different connectivity)
     # Example: "ROG Phone 3 5G" should match "ROG Phone 3" at 100%
     s = re.sub(r'\b[345]g\b', '', s, flags=re.IGNORECASE)
     s = re.sub(r'\blte\b', '', s, flags=re.IGNORECASE)
+
+    # KEEP variant suffixes - these indicate different physical products!
+    # "Max", "Plus", "XL", "Pro" are already preserved (not removed)
+    # Letter model variants (7X, 7C, 8X) are already preserved (part of tokens)
+    # Product type keywords (Tab, Watch, Fold, Note) are already preserved
 
     # Collapse whitespace
     s = re.sub(r'\s+', ' ', s).strip()
@@ -705,24 +722,51 @@ def extract_model_tokens(text: str) -> List[str]:
     """
     Extract model-identifying tokens from a normalized product string.
 
-    Returns tokens that contain digits but aren't storage (gb/tb/mb) or
-    connectivity (3g/4g/5g). Includes letter prefixes/suffixes so we can
-    distinguish variants like "5t" vs "5i" or "a57" vs "a57s".
+    Returns tokens that contain digits OR are variant keywords (max, plus, xl, pro, etc).
+    This ensures Pro vs Pro Max are distinguished by the model token guardrail.
+
+    Extracts:
+    - Tokens with digits: "14", "5t", "a57s", "s23"
+    - Variant keywords: "max", "plus", "xl", "mini", "lite", "ultra"
+    - Product type keywords: "tab", "watch", "fold", "flip", "note"
+    - Letter suffixes: "7x", "7c", "8x" (already captured if they have digits)
 
     Examples:
-        'apple iphone 14 pro 256gb' -> ['14']
+        'apple iphone 14 pro 256gb' -> ['14', 'pro']
+        'apple iphone 11 pro max 256gb' -> ['11', 'pro', 'max']
         'huawei nova 5t 128gb'      -> ['5t']
-        'oppo a57s 64gb'            -> ['a57s']
-        'samsung galaxy s23 256gb'  -> ['s23']
-        'google pixel 9 5g 256gb'   -> ['9']
+        'honor 7 series honor 7x 32gb' -> ['7', '7x']
+        'samsung galaxy tab s8 128gb' -> ['tab', 's8']
+        'google pixel 9 pro xl 512gb' -> ['9', 'pro', 'xl']
     """
     # Remove storage tokens (e.g., "256gb", "1tb")
     text_clean = re.sub(r'\b\d+(?:gb|tb|mb)\b', '', text)
     # Remove connectivity markers (e.g., "5g", "4g")
     text_clean = re.sub(r'\b[345]g\b', '', text_clean)
-    # Get remaining tokens that contain at least one digit
+
+    # Variant keywords that distinguish different products
+    # These are critical identifiers that must match for products to be the same
+    variant_keywords = {
+        # Size variants
+        'max', 'plus', 'mini', 'xl', 'ultra', 'lite', 'pro',
+        # Product types (different categories!)
+        'tab', 'watch', 'fold', 'flip', 'note', 'pad', 'book',
+        # Generation markers that matter
+        'edge', 'active', 'prime',
+    }
+
     tokens = text_clean.split()
-    return [t for t in tokens if re.search(r'\d', t)]
+    model_tokens = []
+
+    for token in tokens:
+        # Include if token contains a digit (existing logic)
+        if re.search(r'\d', token):
+            model_tokens.append(token)
+        # Also include if token is a variant keyword (NEW!)
+        elif token in variant_keywords:
+            model_tokens.append(token)
+
+    return model_tokens
 
 
 def verify_critical_attributes(query: str, matched: str) -> bool:
