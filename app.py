@@ -146,9 +146,18 @@ if asset_upload is not None:
     # ------------------------------------------------------------------
     st.divider()
     st.subheader("🧪 Test Single Match")
+
+    # Get unique brands from catalog for dropdown
+    available_brands = sorted(df_nl_clean['brand'].unique())
+
     tc1, tc2, tc3 = st.columns([2, 2, 1])
     with tc1:
-        test_brand = st.text_input("Brand", value="Apple", key="test_brand")
+        test_brand = st.selectbox(
+            "Brand",
+            options=available_brands,
+            index=available_brands.index("Apple") if "Apple" in available_brands else 0,
+            key="test_brand"
+        )
     with tc2:
         test_name = st.text_input("Product Name", value="iPhone 6 16GB", key="test_name")
     with tc3:
@@ -164,10 +173,17 @@ if asset_upload is not None:
             st.error(result['error'])
         else:
             best = result['best_match']
-            st.markdown(f"**Result:** `{best['match_status']}` (Score: {best['match_score']}%)")
+            method = best.get('method', 'unknown')
+            method_emoji = "⚡" if method == "attribute" else "🔍" if method == "fuzzy" else "❓"
+            st.markdown(f"**Result:** `{best['match_status']}` (Score: {best['match_score']}%) {method_emoji} `{method}`")
             if best['mapped_uae_assetid']:
                 st.success(f"Asset ID: `{best['mapped_uae_assetid']}`")
                 st.caption(f"Matched on: `{best['matched_on']}`")
+
+            st.caption(f"💡 Method: **{method.upper()}** - " +
+                      ("Fast attribute matching (0ms)" if method == "attribute" else
+                       "Fuzzy string matching" if method == "fuzzy" else "No match found"))
+
             alt_df = pd.DataFrame(result['top_3_alternatives'])
             alt_df['asset_ids'] = alt_df['asset_ids'].apply(lambda x: ', '.join(x) if x else 'N/A')
             st.dataframe(alt_df[['nl_name', 'score', 'status', 'asset_ids']], use_container_width=True, hide_index=True)
