@@ -7,7 +7,7 @@ Users only need to upload their asset list Excel files.
 Run with:
     streamlit run app.py
 
-Version: FULLY FIXED - attribute extraction + zip() bug (Feb 2026)
+Version: FULLY FIXED + NL catalog rebuilt with years (Feb 2026)
 """
 
 import io
