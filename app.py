@@ -6,6 +6,8 @@ Users only need to upload their asset list Excel files.
 
 Run with:
     streamlit run app.py
+
+Version: Enhanced model token extraction (Feb 2026)
 """
 
 import io
