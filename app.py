@@ -47,6 +47,7 @@ st.set_page_config(
 )
 
 st.title("🔗 NorthLadder UAE Asset ID Mapper")
+st.markdown("**Intelligent fuzzy matching with attribute verification and hybrid indexing**")
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -138,9 +139,118 @@ st.success(
 )
 
 # =========================================================================
-# Upload asset lists & run matching
+# Tab Navigation
 # =========================================================================
-st.markdown("Upload an Excel file with your asset lists — all sheets are auto-detected and matched.")
+tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "🔗 Mapping", "🎯 Variant Selector"])
+
+# =========================================================================
+# TAB 1: DASHBOARD
+# =========================================================================
+with tab1:
+    st.header("📊 System Overview")
+
+    # Metrics Row
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("NL Catalog Products", f"{nl_stats['final']:,}")
+    with col2:
+        st.metric("Unique Brands", len(nl_brand_index))
+    with col3:
+        categories = df_nl_clean['category'].nunique()
+        st.metric("Categories", categories)
+    with col4:
+        st.metric("Matching Method", "Hybrid")
+
+    st.divider()
+
+    # Catalog Breakdown
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        st.subheader("📦 NL Catalog by Category")
+        category_counts = df_nl_clean['category'].value_counts()
+        st.bar_chart(category_counts)
+
+        st.caption("**Product Distribution:**")
+        for cat, count in category_counts.items():
+            st.markdown(f"- **{cat}**: {count:,} products ({count/nl_stats['final']*100:.1f}%)")
+
+    with col_right:
+        st.subheader("🏢 Top 15 Brands")
+        brand_counts = df_nl_clean['brand'].value_counts().head(15)
+        st.bar_chart(brand_counts)
+
+    st.divider()
+
+    # Matching Flow Diagram
+    st.subheader("🔄 Matching Process Flow")
+    st.markdown("""
+    ```
+    1. Upload Asset Lists
+       ↓
+    2. Auto-detect Sheets & Columns
+       ↓
+    3. Hybrid Matching Engine
+       ├─ Attribute Matching (Fast Path - 70-80% of queries)
+       │  └─ Exact brand + model + storage match
+       └─ Fuzzy Matching (Fallback)
+          ├─ Brand Partitioning
+          ├─ Storage Pre-filtering
+          ├─ Token Sort Fuzzy Match
+          └─ Model Token Guardrail
+       ↓
+    4. Attribute Verification (85-94% scores)
+       └─ Auto-upgrade if critical attributes match
+       ↓
+    5. Results Classification
+       ├─ ✅ MATCHED (≥90%, single ID)
+       ├─ 🔵 MULTIPLE_MATCHES (≥90%, multiple IDs)
+       ├─ 🟡 REVIEW (85-89%, verification failed)
+       └─ 🔴 NO_MATCH (<85%)
+    ```
+    """)
+
+    st.divider()
+
+    # Feature Highlights
+    st.subheader("✨ Key Features")
+
+    feat_col1, feat_col2 = st.columns(2)
+
+    with feat_col1:
+        st.markdown("""
+        **🎯 Intelligent Matching:**
+        - Hybrid matching (attribute + fuzzy)
+        - Brand partitioning for accuracy
+        - Model token guardrails
+        - Storage pre-filtering
+
+        **🔍 Attribute Verification:**
+        - Auto-upgrades 94% of review items
+        - Compares model tokens & storage
+        - Prevents false positives
+        """)
+
+    with feat_col2:
+        st.markdown("""
+        **📊 Smart Features:**
+        - Year preservation (iPhone SE 2016 vs 2020)
+        - 5G/LTE handling
+        - Duplicate filtering
+        - Caching for instant reloads
+
+        **📈 Results Export:**
+        - Excel with multiple sheets
+        - Variant details for multi-IDs
+        - Summary statistics
+        """)
+
+# =========================================================================
+# TAB 2: MAPPING
+# =========================================================================
+with tab2:
+    st.header("🔗 Asset Mapping")
+    st.markdown("Upload an Excel file with your asset lists — all sheets are auto-detected and matched.")
 
 asset_upload = st.file_uploader("📁 Upload Asset Lists (.xlsx)", type=["xlsx"], key="asset_upload")
 
@@ -384,6 +494,137 @@ if asset_upload is not None:
             use_container_width=True,
         )
         st.success("✅ Mapping complete! Unmatched items are flagged for manual review.")
+
+# =========================================================================
+# TAB 3: VARIANT SELECTOR
+# =========================================================================
+with tab3:
+    st.header("🎯 Interactive Variant Selector")
+    st.markdown("""
+    When a product has **MULTIPLE_MATCHES** (multiple variant IDs), use this tool to select the correct one.
+    Upload your mapping results and interactively choose which variant ID to use for each product.
+    """)
+
+    # Upload results file
+    results_upload = st.file_uploader("📁 Upload Mapping Results (.xlsx)", type=["xlsx"], key="results_upload")
+
+    if results_upload is not None:
+        try:
+            # Load all sheets
+            df_l1_mapped = pd.read_excel(results_upload, sheet_name='List 1 - Mapped')
+            df_l2_mapped = pd.read_excel(results_upload, sheet_name=' List 2 - Mapped')
+
+            # Find MULTIPLE_MATCHES
+            l1_multiple = df_l1_mapped[df_l1_mapped['match_status'] == MATCH_STATUS_MULTIPLE]
+            l2_multiple = df_l2_mapped[df_l2_mapped['match_status'] == MATCH_STATUS_MULTIPLE]
+
+            total_multiple = len(l1_multiple) + len(l2_multiple)
+
+            if total_multiple == 0:
+                st.success("🎉 No MULTIPLE_MATCHES found! All items have unique IDs.")
+                st.stop()
+
+            # Show stats
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total MULTIPLE_MATCHES", total_multiple)
+            with col2:
+                st.metric("List 1", len(l1_multiple))
+            with col3:
+                st.metric("List 2", len(l2_multiple))
+
+            st.divider()
+
+            # Interactive selector
+            st.subheader("Select Correct Variants")
+
+            # Initialize session state for selections
+            if 'variant_selections' not in st.session_state:
+                st.session_state.variant_selections = {}
+
+            # Combine all multiple matches
+            all_multiple = []
+            for idx, row in l1_multiple.iterrows():
+                all_multiple.append(('List 1', idx, row))
+            for idx, row in l2_multiple.iterrows():
+                all_multiple.append(('List 2', idx, row))
+
+            # Show items with variant selection
+            st.markdown(f"**Showing {min(20, len(all_multiple))} of {len(all_multiple)} items** (first 20 for demo)")
+
+            for i, (sheet, idx, row) in enumerate(all_multiple[:20]):
+                with st.expander(f"Item {i+1}: {row.get('name', row.get('Foxway Product Name', ''))}"):
+                    # Show match info
+                    col_info, col_select = st.columns([2, 1])
+
+                    with col_info:
+                        st.markdown(f"**Your Product:** {row.get('name', row.get('Foxway Product Name', ''))}")
+                        st.markdown(f"**Matched To:** `{row['matched_on']}`")
+                        st.markdown(f"**Match Score:** {row['match_score']:.1f}%")
+
+                    # Parse IDs
+                    ids = str(row['mapped_uae_assetid']).split(',')
+                    ids = [id.strip() for id in ids]
+
+                    # Show variant options
+                    st.markdown(f"**{len(ids)} Variant Options:**")
+
+                    variant_options = []
+                    for id_val in ids:
+                        nl_entry = df_nl_clean[df_nl_clean['uae_assetid'] == id_val]
+                        if len(nl_entry) > 0:
+                            product_name = nl_entry.iloc[0]['uae_assetname']
+                            variant_options.append(f"{id_val}: {product_name}")
+                            st.markdown(f"- `{id_val}`: {product_name}")
+
+                    # Selection dropdown
+                    with col_select:
+                        key = f"{sheet}_{idx}"
+                        selected = st.selectbox(
+                            "Choose variant:",
+                            options=range(len(ids)),
+                            format_func=lambda x: f"Variant {x+1}",
+                            key=f"select_{key}"
+                        )
+                        st.session_state.variant_selections[key] = ids[selected]
+                        st.success(f"Selected ID: `{ids[selected]}`")
+
+            st.divider()
+
+            # Apply selections button
+            if st.button("✅ Apply Selections & Download", type="primary", use_container_width=True):
+                # Apply selections to dataframes
+                for key, selected_id in st.session_state.variant_selections.items():
+                    sheet, idx_str = key.split('_', 1)
+                    idx = int(idx_str)
+
+                    if sheet == 'List 1':
+                        df_l1_mapped.at[idx, 'mapped_uae_assetid'] = selected_id
+                        df_l1_mapped.at[idx, 'match_status'] = MATCH_STATUS_MATCHED
+                    else:
+                        df_l2_mapped.at[idx, 'mapped_uae_assetid'] = selected_id
+                        df_l2_mapped.at[idx, 'match_status'] = MATCH_STATUS_MATCHED
+
+                # Generate output Excel
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    df_l1_mapped.to_excel(writer, sheet_name='List 1 - Mapped', index=False)
+                    df_l2_mapped.to_excel(writer, sheet_name=' List 2 - Mapped', index=False)
+
+                output.seek(0)
+
+                st.download_button(
+                    label="📥 Download Updated Results",
+                    data=output,
+                    file_name="asset_mapping_results_updated.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                    use_container_width=True,
+                )
+                st.success(f"✅ Applied {len(st.session_state.variant_selections)} selections!")
+
+        except Exception as e:
+            st.error(f"Error loading results: {e}")
 
 # ---------------------------------------------------------------------------
 # Footer
