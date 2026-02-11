@@ -340,6 +340,38 @@ if asset_upload is not None:
                     safe_name = f"{sheet_name} - Unmatched"[:31]
                     unmatched.to_excel(writer, sheet_name=safe_name, index=False)
 
+            # Add variant details for MULTIPLE_MATCHES items
+            variant_details = []
+            for sheet_name, df_result in all_results.items():
+                multiple = df_result[df_result['match_status'] == MATCH_STATUS_MULTIPLE]
+                for idx, row in multiple.iterrows():
+                    # Get original product name
+                    name_col = 'name' if 'name' in row else 'Foxway Product Name'
+                    original_name = row[name_col]
+
+                    # Split comma-separated IDs
+                    ids = str(row['mapped_uae_assetid']).split(',')
+                    ids = [id.strip() for id in ids]
+
+                    # Look up each ID in NL catalog to get full product name
+                    for id_val in ids:
+                        nl_entry = df_nl_clean[df_nl_clean['uae_assetid'] == id_val]
+                        if len(nl_entry) > 0:
+                            variant_details.append({
+                                'Sheet': sheet_name,
+                                'Your Product': original_name,
+                                'Matched To': row['matched_on'],
+                                'Match Score': f"{row['match_score']:.1f}%",
+                                'Variant ID': id_val,
+                                'NL Product Name': nl_entry.iloc[0]['uae_assetname'],
+                                'Category': nl_entry.iloc[0]['category'],
+                                'Brand': nl_entry.iloc[0]['brand'],
+                            })
+
+            if variant_details:
+                df_variants = pd.DataFrame(variant_details)
+                df_variants.to_excel(writer, sheet_name='Multiple ID Variants', index=False)
+
         output.seek(0)
 
         st.divider()

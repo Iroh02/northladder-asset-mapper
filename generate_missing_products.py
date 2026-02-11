@@ -1,7 +1,15 @@
-"""Generate list of missing products to add to NL catalog"""
+"""Generate list of missing products to add to NL catalog
+
+This script analyzes NO_MATCH items and generates a list of products that
+should be added to the NL catalog to improve match rates.
+
+Usage:
+    python generate_missing_products.py
+"""
 import pandas as pd
 
-results_path = r"c:\Users\nandi\Desktop\internship northladder docs\asset_mapping_results (7).xlsx"
+# Use latest results file
+results_path = r"c:\Users\nandi\Desktop\internship northladder docs\asset_mapping_results (11).xlsx"
 
 # Load unmatched items
 df_l1_unmatched = pd.read_excel(results_path, sheet_name='List 1 - Unmatched')
