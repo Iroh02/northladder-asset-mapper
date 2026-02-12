@@ -515,7 +515,9 @@ def build_attribute_index(df_nl_clean: pd.DataFrame) -> Dict:
 def try_attribute_match(
     query: str,
     brand: str,
-    attribute_index: Dict
+    attribute_index: Dict,
+    nl_catalog: Optional[pd.DataFrame] = None,
+    original_input: str = ''
 ) -> Optional[dict]:
     """
     Attempt fast attribute-based matching before falling back to fuzzy.
@@ -542,38 +544,99 @@ def try_attribute_match(
         # Try exact match with RAM+storage (laptops) or just storage (phones)
         if storage_key in model_data:
             entry = model_data[storage_key]
-            return {
-                'mapped_uae_assetid': ', '.join(entry['asset_ids']),
-                'match_score': 100.0,
-                'match_status': MATCH_STATUS_MULTIPLE if len(entry['asset_ids']) > 1 else MATCH_STATUS_MATCHED,
-                'confidence': CONFIDENCE_HIGH,
-                'matched_on': entry['nl_name'],
-                'method': 'attribute'
-            }
+            asset_ids = entry['asset_ids']
+
+            # Auto-select if multiple IDs and catalog provided
+            if len(asset_ids) > 1 and nl_catalog is not None:
+                user_input_for_auto_select = original_input if original_input else query
+                selection = auto_select_matching_variant(user_input_for_auto_select, asset_ids, nl_catalog)
+                return {
+                    'mapped_uae_assetid': selection['selected_id'],
+                    'match_score': 100.0,
+                    'match_status': MATCH_STATUS_MATCHED,
+                    'confidence': CONFIDENCE_HIGH,
+                    'matched_on': entry['nl_name'],
+                    'method': 'attribute_auto_selected',
+                    'auto_selected': selection['auto_selected'],
+                    'selection_reason': selection['reason'],
+                    'alternatives': selection['alternatives'],
+                }
+            else:
+                return {
+                    'mapped_uae_assetid': ', '.join(asset_ids),
+                    'match_score': 100.0,
+                    'match_status': MATCH_STATUS_MATCHED,
+                    'confidence': CONFIDENCE_HIGH,
+                    'matched_on': entry['nl_name'],
+                    'method': 'attribute',
+                    'auto_selected': False,
+                    'selection_reason': '',
+                    'alternatives': [],
+                }
 
         # Fallback: try without RAM if laptop match failed (maybe RAM not in query)
         if ram and attrs['storage'] in model_data:
             entry = model_data[attrs['storage']]
-            return {
-                'mapped_uae_assetid': ', '.join(entry['asset_ids']),
-                'match_score': 95.0,  # Slightly lower since RAM didn't match
-                'match_status': MATCH_STATUS_MULTIPLE if len(entry['asset_ids']) > 1 else MATCH_STATUS_MATCHED,
-                'confidence': CONFIDENCE_HIGH,
-                'matched_on': entry['nl_name'],
-                'method': 'attribute'
-            }
+            asset_ids = entry['asset_ids']
+
+            if len(asset_ids) > 1 and nl_catalog is not None:
+                user_input_for_auto_select = original_input if original_input else query
+                selection = auto_select_matching_variant(user_input_for_auto_select, asset_ids, nl_catalog)
+                return {
+                    'mapped_uae_assetid': selection['selected_id'],
+                    'match_score': 95.0,
+                    'match_status': MATCH_STATUS_MATCHED,
+                    'confidence': CONFIDENCE_HIGH,
+                    'matched_on': entry['nl_name'],
+                    'method': 'attribute_auto_selected',
+                    'auto_selected': selection['auto_selected'],
+                    'selection_reason': selection['reason'],
+                    'alternatives': selection['alternatives'],
+                }
+            else:
+                return {
+                    'mapped_uae_assetid': ', '.join(asset_ids),
+                    'match_score': 95.0,
+                    'match_status': MATCH_STATUS_MATCHED,
+                    'confidence': CONFIDENCE_HIGH,
+                    'matched_on': entry['nl_name'],
+                    'method': 'attribute',
+                    'auto_selected': False,
+                    'selection_reason': '',
+                    'alternatives': [],
+                }
 
         # Try without storage if no exact match (for products without storage in name)
         if '' in model_data:  # Empty storage key
             entry = model_data['']
-            return {
-                'mapped_uae_assetid': ', '.join(entry['asset_ids']),
-                'match_score': 90.0,  # Lower since storage/RAM didn't match
-                'match_status': MATCH_STATUS_MULTIPLE if len(entry['asset_ids']) > 1 else MATCH_STATUS_MATCHED,
-                'confidence': CONFIDENCE_MEDIUM,
-                'matched_on': entry['nl_name'],
-                'method': 'attribute'
-            }
+            asset_ids = entry['asset_ids']
+
+            if len(asset_ids) > 1 and nl_catalog is not None:
+                user_input_for_auto_select = original_input if original_input else query
+                selection = auto_select_matching_variant(user_input_for_auto_select, asset_ids, nl_catalog)
+                return {
+                    'mapped_uae_assetid': selection['selected_id'],
+                    'match_score': 90.0,
+                    'match_status': MATCH_STATUS_MATCHED,
+                    'confidence': CONFIDENCE_MEDIUM,
+                    'matched_on': entry['nl_name'],
+                    'method': 'attribute_auto_selected',
+                    'auto_selected': selection['auto_selected'],
+                    'selection_reason': selection['reason'],
+                    'alternatives': selection['alternatives'],
+                }
+            else:
+                return {
+                    'mapped_uae_assetid': ', '.join(asset_ids),
+                    'match_score': 90.0,
+                    'match_status': MATCH_STATUS_MATCHED,
+                    'confidence': CONFIDENCE_MEDIUM,
+                    'matched_on': entry['nl_name'],
+                    'method': 'attribute',
+                    'auto_selected': False,
+                    'selection_reason': '',
+                    'alternatives': [],
+                }
 
     except (KeyError, AttributeError):
         pass
@@ -702,6 +765,36 @@ def extract_storage(text: str) -> str:
     return storage_match[0] if storage_match else ''
 
 
+def extract_category(text: str) -> str:
+    """
+    Extract product category from normalized text.
+
+    Returns one of: 'mobile', 'tablet', 'watch', 'laptop', 'other'
+
+    Used for category filtering to prevent cross-category false matches
+    (e.g., Galaxy Tab should NOT match Galaxy Watch).
+    """
+    text_lower = text.lower()
+
+    # Tablets: Must check before "phone" (some products have both keywords)
+    if any(kw in text_lower for kw in ['tab', 'tablet', 'ipad']):
+        return 'tablet'
+
+    # Smartwatches: Must check before "phone"
+    if 'watch' in text_lower:
+        return 'watch'
+
+    # Laptops: Check before mobile (MacBook, ThinkPad, etc.)
+    if is_laptop_product(text):
+        return 'laptop'
+
+    # Mobile phones: Most common category
+    if any(kw in text_lower for kw in ['iphone', 'phone', 'mobile', 'smartphone', 'galaxy s', 'galaxy a', 'galaxy z', 'pixel', 'redmi', 'mi ', 'mate', 'nova', 'find', 'reno']):
+        return 'mobile'
+
+    return 'other'
+
+
 def extract_attributes(text: str) -> Dict[str, str]:
     """
     Extract structured attributes from a normalized product string.
@@ -773,6 +866,126 @@ def extract_model_tokens(text: str) -> List[str]:
             model_tokens.append(token)
 
     return model_tokens
+
+
+def auto_select_matching_variant(
+    user_input: str,
+    asset_ids: List[str],
+    nl_catalog: pd.DataFrame
+) -> dict:
+    """
+    Automatically select the best variant from MULTIPLE_MATCHES based on user's exact specs.
+
+    For recommerce: Match what user HAS, not what's 'better'.
+    - If user has 5G, select 5G variant (not 4G)
+    - If user has 4G, select 4G variant (not 5G)
+    - If user specifies a year, select that year (not newer/older)
+    - If truly identical, select first ID
+
+    Returns dict:
+        'selected_id': The chosen asset ID
+        'auto_selected': True if auto-selected, False if manual selection needed
+        'reason': Human-readable explanation of selection logic
+        'alternatives': List of other asset IDs (for manual override)
+    """
+    if len(asset_ids) == 0:
+        return {
+            'selected_id': '',
+            'auto_selected': False,
+            'reason': 'No variants found',
+            'alternatives': []
+        }
+
+    if len(asset_ids) == 1:
+        return {
+            'selected_id': asset_ids[0],
+            'auto_selected': False,
+            'reason': 'Single match',
+            'alternatives': []
+        }
+
+    # Get all variant details
+    variants = nl_catalog[nl_catalog['uae_assetid'].isin(asset_ids)]
+
+    if len(variants) == 0:
+        return {
+            'selected_id': asset_ids[0],
+            'auto_selected': False,
+            'reason': 'Variants not found in catalog',
+            'alternatives': asset_ids[1:]
+        }
+
+    # === PRIORITY 1: Year matching (most specific) ===
+    user_year = re.search(r'\b(20\d{2})\b', user_input)
+    if user_year:
+        year = user_year.group(1)
+        match_year = variants[variants['uae_assetname'].str.contains(year, na=False)]
+        if len(match_year) > 0:
+            selected = match_year.iloc[0]['uae_assetid']
+            alternatives = [aid for aid in asset_ids if aid != selected]
+            return {
+                'selected_id': selected,
+                'auto_selected': True,
+                'reason': f'Matched year {year}',
+                'alternatives': alternatives
+            }
+
+    # === PRIORITY 2: Connectivity matching (5G vs 4G/LTE) ===
+    user_has_5g = '5g' in user_input.lower()
+    user_has_4g = any(x in user_input.lower() for x in ['4g', 'lte'])
+
+    if user_has_5g:
+        # User has 5G -> select 5G variant
+        match_5g = variants[variants['uae_assetname'].str.contains('5G|5g', na=False, regex=True)]
+        if len(match_5g) > 0:
+            selected = match_5g.iloc[0]['uae_assetid']
+            alternatives = [aid for aid in asset_ids if aid != selected]
+            return {
+                'selected_id': selected,
+                'auto_selected': True,
+                'reason': 'Matched 5G (user has 5G)',
+                'alternatives': alternatives
+            }
+
+    if user_has_4g:
+        # User has 4G/LTE -> select non-5G variant
+        match_4g = variants[~variants['uae_assetname'].str.contains('5G|5g', na=False, regex=True)]
+        if len(match_4g) > 0:
+            selected = match_4g.iloc[0]['uae_assetid']
+            alternatives = [aid for aid in asset_ids if aid != selected]
+            return {
+                'selected_id': selected,
+                'auto_selected': True,
+                'reason': 'Matched 4G/LTE (user has 4G/LTE)',
+                'alternatives': alternatives
+            }
+
+    # Check if NL has connectivity difference but user doesn't specify
+    has_5g_variant = any('5g' in str(v).lower() for v in variants['uae_assetname'])
+    has_4g_variant = any(not ('5g' in str(v).lower()) for v in variants['uae_assetname'])
+
+    if has_5g_variant and has_4g_variant:
+        # User didn't specify, default to non-5G (more common in recommerce inventory)
+        match_4g = variants[~variants['uae_assetname'].str.contains('5G|5g', na=False, regex=True)]
+        if len(match_4g) > 0:
+            selected = match_4g.iloc[0]['uae_assetid']
+            alternatives = [aid for aid in asset_ids if aid != selected]
+            return {
+                'selected_id': selected,
+                'auto_selected': True,
+                'reason': 'Defaulted to 4G (user unspecified)',
+                'alternatives': alternatives
+            }
+
+    # === PRIORITY 3: Truly identical variants -> pick first ===
+    selected = variants.iloc[0]['uae_assetid']
+    alternatives = asset_ids[1:] if len(asset_ids) > 1 else []
+    return {
+        'selected_id': selected,
+        'auto_selected': True,
+        'reason': 'First ID (variants identical)',
+        'alternatives': alternatives
+    }
 
 
 def verify_critical_attributes(query: str, matched: str) -> bool:
@@ -874,6 +1087,8 @@ def match_single_item(
     brand_index: Optional[Dict] = None,
     input_brand: str = '',
     attribute_index: Optional[Dict] = None,
+    nl_catalog: Optional[pd.DataFrame] = None,
+    original_input: str = '',
 ) -> dict:
     """
     Match a single product against the NL list using hybrid matching.
@@ -884,10 +1099,13 @@ def match_single_item(
            - Works especially well for Samsung (strips model codes), iPhone, Pixel, Galaxy
         1. BRAND FILTER: If brand is known, search only within that brand's products
            (e.g., 9,894 → ~2,000 Apple records). Eliminates cross-brand errors.
-        2. STORAGE FILTER: If storage is detected (e.g., "16gb"), prefer candidates
+        2. CATEGORY FILTER: Prevent cross-category matches (Tab vs Watch, Mobile vs Laptop)
+        3. STORAGE FILTER: If storage is detected (e.g., "16gb"), prefer candidates
            with the same storage. Prevents "16GB" matching "128GB" variants.
-        3. FUZZY MATCH: token_sort_ratio on the narrowed candidate list.
-        4. MODEL TOKEN GUARD: Reject if model tokens differ (e.g., iPhone 4 vs 6).
+        4. FUZZY MATCH: token_sort_ratio on the narrowed candidate list.
+        5. MODEL TOKEN GUARD: Reject if model tokens differ (e.g., iPhone 4 vs 6).
+        6. AUTO-SELECT: If multiple IDs found, automatically select best variant based on
+           user's exact specs (year, connectivity, etc.)
 
     Falls back through levels if earlier levels don't produce confident matches.
     """
@@ -898,6 +1116,9 @@ def match_single_item(
         'confidence': CONFIDENCE_LOW,
         'matched_on': '',
         'method': 'none',
+        'auto_selected': False,
+        'selection_reason': '',
+        'alternatives': [],
     }
 
     if not query:
@@ -905,7 +1126,7 @@ def match_single_item(
 
     # --- Level 0: Attribute-based matching (FAST PATH) ---
     if attribute_index and input_brand:
-        attr_match = try_attribute_match(query, input_brand, attribute_index)
+        attr_match = try_attribute_match(query, input_brand, attribute_index, nl_catalog, original_input)
         if attr_match:
             return attr_match  # Found exact match, skip fuzzy entirely
 
@@ -920,7 +1141,15 @@ def match_single_item(
         search_lookup = brand_data['lookup']
         search_names = brand_data['names']
 
-    # --- Level 2: Storage pre-filter ---
+    # --- Level 2: Category filtering ---
+    query_category = extract_category(query)
+    if query_category != 'other' and len(search_names) > 20:
+        # Filter candidates to same category (prevent Tab matching Watch, etc.)
+        category_filtered = [n for n in search_names if extract_category(n) == query_category]
+        if category_filtered:
+            search_names = category_filtered
+
+    # --- Level 3: Storage pre-filter ---
     query_storage = extract_storage(query)
     if query_storage and len(search_names) > 20:
         # Filter candidates to those with the same storage
@@ -928,7 +1157,7 @@ def match_single_item(
         if storage_filtered:
             search_names = storage_filtered
 
-    # --- Level 3: Fuzzy match on narrowed candidates ---
+    # --- Level 4: Fuzzy match on narrowed candidates ---
     result = process.extractOne(
         query,
         search_names,
@@ -955,7 +1184,7 @@ def match_single_item(
     if not asset_ids:
         asset_ids = nl_lookup.get(best_match, [])
 
-    # --- Level 4: Model token guardrail ---
+    # --- Level 5: Model token guardrail ---
     # Applied to ALL scores (including >= 95%) to prevent false positives
     # like Pixel 9 → Pixel 3 (95%), Mate 20 → Mate 40 (95%),
     # Nova 5T → Nova 5i (95%), A57 → A57s (96%)
@@ -1000,17 +1229,42 @@ def match_single_item(
             'confidence': CONFIDENCE_LOW,
             'matched_on': best_match,
             'method': 'fuzzy',
+            'auto_selected': False,
+            'selection_reason': '',
+            'alternatives': [],
         }
     elif confidence == CONFIDENCE_HIGH:
-        status = MATCH_STATUS_MULTIPLE if len(asset_ids) > 1 else MATCH_STATUS_MATCHED
-        return {
-            'mapped_uae_assetid': ', '.join(asset_ids),
-            'match_score': score_rounded,
-            'match_status': status,
-            'confidence': confidence,
-            'matched_on': best_match,
-            'method': 'fuzzy',
-        }
+        # --- Level 6: Auto-select for MULTIPLE_MATCHES ---
+        if len(asset_ids) > 1 and nl_catalog is not None:
+            # Auto-select best variant based on user's exact specs
+            # Use original_input (before normalization) to detect 5G/4G/years correctly
+            user_input_for_auto_select = original_input if original_input else query
+            selection = auto_select_matching_variant(user_input_for_auto_select, asset_ids, nl_catalog)
+
+            return {
+                'mapped_uae_assetid': selection['selected_id'],
+                'match_score': score_rounded,
+                'match_status': MATCH_STATUS_MATCHED,  # Auto-selected -> MATCHED
+                'confidence': confidence,
+                'matched_on': best_match,
+                'method': 'fuzzy_auto_selected',
+                'auto_selected': selection['auto_selected'],
+                'selection_reason': selection['reason'],
+                'alternatives': selection['alternatives'],
+            }
+        else:
+            # Single match or no catalog provided
+            return {
+                'mapped_uae_assetid': ', '.join(asset_ids),
+                'match_score': score_rounded,
+                'match_status': MATCH_STATUS_MATCHED,
+                'confidence': confidence,
+                'matched_on': best_match,
+                'method': 'fuzzy',
+                'auto_selected': False,
+                'selection_reason': '',
+                'alternatives': [],
+            }
     else:
         # MEDIUM confidence (85-94%): Apply attribute verification
         # If critical attributes match, upgrade to MATCHED
@@ -1019,15 +1273,34 @@ def match_single_item(
 
         if verified:
             # All critical attributes match -> safe to auto-accept
-            status = MATCH_STATUS_MULTIPLE if len(asset_ids) > 1 else MATCH_STATUS_MATCHED
-            return {
-                'mapped_uae_assetid': ', '.join(asset_ids),
-                'match_score': score_rounded,
-                'match_status': status,
-                'confidence': confidence,
-                'matched_on': best_match,
-                'method': 'fuzzy_verified',  # Indicate this was verified
-            }
+            # Check for auto-select if multiple IDs
+            if len(asset_ids) > 1 and nl_catalog is not None:
+                user_input_for_auto_select = original_input if original_input else query
+                selection = auto_select_matching_variant(user_input_for_auto_select, asset_ids, nl_catalog)
+
+                return {
+                    'mapped_uae_assetid': selection['selected_id'],
+                    'match_score': score_rounded,
+                    'match_status': MATCH_STATUS_MATCHED,
+                    'confidence': confidence,
+                    'matched_on': best_match,
+                    'method': 'fuzzy_verified_auto_selected',
+                    'auto_selected': selection['auto_selected'],
+                    'selection_reason': selection['reason'],
+                    'alternatives': selection['alternatives'],
+                }
+            else:
+                return {
+                    'mapped_uae_assetid': ', '.join(asset_ids),
+                    'match_score': score_rounded,
+                    'match_status': MATCH_STATUS_MATCHED,
+                    'confidence': confidence,
+                    'matched_on': best_match,
+                    'method': 'fuzzy_verified',  # Indicate this was verified
+                    'auto_selected': False,
+                    'selection_reason': '',
+                    'alternatives': [],
+                }
         else:
             # Critical attributes differ -> needs human review
             return {
@@ -1037,6 +1310,9 @@ def match_single_item(
                 'confidence': confidence,
                 'matched_on': best_match,
                 'method': 'fuzzy',
+                'auto_selected': False,
+                'selection_reason': '',
+                'alternatives': [],
             }
 
 
@@ -1050,6 +1326,7 @@ def run_matching(
     progress_callback: Optional[Callable] = None,
     brand_index: Optional[Dict] = None,
     attribute_index: Optional[Dict] = None,
+    nl_catalog: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     Run hybrid matching for an entire input DataFrame against the NL lookup.
@@ -1057,9 +1334,11 @@ def run_matching(
     Matching is hybrid (attribute-based fast path + fuzzy fallback):
         0. Attribute matching (fast path) → 70-80% of queries in 2-5ms
         1. Brand partition → narrows search to one brand
-        2. Storage filter → narrows to same storage variant
-        3. Fuzzy match → finds best candidate
-        4. Model token guard → rejects wrong model tokens
+        2. Category filter → prevents cross-category errors
+        3. Storage filter → narrows to same storage variant
+        4. Fuzzy match → finds best candidate
+        5. Model token guard → rejects wrong model tokens
+        6. Auto-select → automatically selects best variant from multiple matches
 
     Args:
         df_input: The input asset list (List 1 or List 2)
@@ -1071,10 +1350,12 @@ def run_matching(
         progress_callback: optional callable(current, total) for UI progress
         brand_index: brand-partitioned index from build_brand_index()
         attribute_index: attribute-based index from build_attribute_index()
+        nl_catalog: NL catalog DataFrame for auto-select (optional)
 
     Returns:
         Copy of df_input with added columns:
-            mapped_uae_assetid, match_score, match_status, confidence, matched_on
+            mapped_uae_assetid, match_score, match_status, confidence, matched_on,
+            auto_selected, selection_reason, alternatives
     """
     df = df_input.copy()
     total = len(df)
@@ -1082,12 +1363,15 @@ def run_matching(
     results = []
     for idx, row in df.iterrows():
         input_brand = str(row.get(brand_col, '')).strip() if brand_col != '__no_brand__' else ''
-        query = build_match_string(input_brand, row.get(name_col, ''))
+        original_product_name = str(row.get(name_col, '')).strip()
+        query = build_match_string(input_brand, original_product_name)
         match_result = match_single_item(
             query, nl_lookup, nl_names, threshold,
             brand_index=brand_index,
             input_brand=input_brand,
             attribute_index=attribute_index,
+            nl_catalog=nl_catalog,
+            original_input=original_product_name,
         )
         results.append(match_result)
 
@@ -1100,6 +1384,10 @@ def run_matching(
     df['match_status'] = results_df['match_status'].values
     df['confidence'] = results_df['confidence'].values
     df['matched_on'] = results_df['matched_on'].values
+    df['method'] = results_df['method'].values
+    df['auto_selected'] = results_df['auto_selected'].values
+    df['selection_reason'] = results_df['selection_reason'].values
+    df['alternatives'] = results_df['alternatives'].values
 
     return df
 
@@ -1116,6 +1404,7 @@ def test_single_match(
     threshold: int = SIMILARITY_THRESHOLD,
     brand_index: Optional[Dict] = None,
     attribute_index: Optional[Dict] = None,
+    nl_catalog: Optional[pd.DataFrame] = None,
 ) -> dict:
     """
     Test matching for a single item. Returns detailed info including top 3 alternatives.
@@ -1164,7 +1453,8 @@ def test_single_match(
 
     best = match_single_item(query, nl_lookup, nl_names, threshold,
                              brand_index=brand_index, input_brand=brand,
-                             attribute_index=attribute_index)
+                             attribute_index=attribute_index, nl_catalog=nl_catalog,
+                             original_input=name)
 
     return {
         'query': query,

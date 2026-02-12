@@ -308,7 +308,8 @@ if asset_upload is not None:
 
     if test_btn:
         result = test_single_match(test_brand, test_name, nl_lookup, nl_names, threshold,
-                                   brand_index=nl_brand_index, attribute_index=nl_attribute_index)
+                                   brand_index=nl_brand_index, attribute_index=nl_attribute_index,
+                                   nl_catalog=df_nl_clean)
         st.markdown(f"**Query:** `{result['query']}`")
         if 'error' in result:
             st.error(result['error'])
@@ -356,6 +357,7 @@ if asset_upload is not None:
                 progress_callback=make_progress_cb(progress, sheet_name),
                 brand_index=nl_brand_index,
                 attribute_index=nl_attribute_index,
+                nl_catalog=df_nl_clean,
             )
             progress.progress(1.0, text=f"✅ {sheet_name} complete!")
             all_results[sheet_name] = df_result
