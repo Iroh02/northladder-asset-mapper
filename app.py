@@ -138,7 +138,7 @@ nl_brand_index = catalog['brand_index']
 nl_attribute_index = catalog['attribute_index']
 
 st.success(
-    f"NL Reference: **{nl_stats['final']:,}** asset records loaded "
+    f"NL Reference: **{nl_stats.get('final', len(df_nl_clean)):,}** asset records loaded "
     f"({len(nl_brand_index)} brands, hybrid matching enabled)"
 )
 
@@ -156,7 +156,7 @@ with tab1:
     # Metrics Row
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("NL Catalog Products", f"{nl_stats['final']:,}")
+        st.metric("NL Catalog Products", f"{nl_stats.get('final', len(df_nl_clean)):,}")
     with col2:
         st.metric("Unique Brands", len(nl_brand_index))
     with col3:
@@ -176,8 +176,9 @@ with tab1:
         st.bar_chart(category_counts)
 
         st.caption("**Product Distribution:**")
+        total_products = nl_stats.get('final', len(df_nl_clean))
         for cat, count in category_counts.items():
-            st.markdown(f"- **{cat}**: {count:,} products ({count/nl_stats['final']*100:.1f}%)")
+            st.markdown(f"- **{cat}**: {count:,} products ({count/total_products*100:.1f}%)")
 
     with col_right:
         st.subheader("🏢 Top 15 Brands")
@@ -440,7 +441,7 @@ if asset_upload is not None:
                 })
             summary_rows.append({'Sheet': '', 'Total': '', 'Matched (HIGH)': '', 'Review Required': '', 'Multiple IDs': '', 'No Match': '', 'Auto-Apply Rate': ''})
             summary_rows.append({
-                'Sheet': 'NL Reference', 'Total': nl_stats['final'],
+                'Sheet': 'NL Reference', 'Total': nl_stats.get('final', len(df_nl_clean)),
                 'Matched (HIGH)': '', 'Review Required': '', 'Multiple IDs': '', 'No Match': '',
                 'Auto-Apply Rate': f"Auto-accept >= {HIGH_CONFIDENCE_THRESHOLD}%",
             })
