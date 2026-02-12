@@ -73,8 +73,10 @@ with st.sidebar.expander("Admin: NL Reference"):
     if nl_reference_exists():
         nl_data = load_nl_reference()
         if nl_data:
-            _, nl_meta = nl_data
-            st.caption(f"Loaded {nl_meta['final']:,} records")
+            df_nl_ref, nl_meta = nl_data
+            # Use .get() with fallback to df length if 'final' key doesn't exist in cached metadata
+            record_count = nl_meta.get('final', len(df_nl_ref))
+            st.caption(f"Loaded {record_count:,} records")
         if st.button("Refresh NL Reference"):
             delete_nl_reference()
             st.cache_data.clear()  # Clear cache to reload catalog
