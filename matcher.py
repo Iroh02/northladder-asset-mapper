@@ -101,6 +101,12 @@ def normalize_text(text: str) -> str:
     s = re.sub(r'\b[345]g\b', '', s, flags=re.IGNORECASE)
     s = re.sub(r'\blte\b', '', s, flags=re.IGNORECASE)
 
+    # Remove regional/SIM variants - these are NOT product differentiators
+    # "Galaxy S10 Dual SIM" vs "Galaxy S10" are SAME base product
+    # "iPhone 12 International" vs "iPhone 12" are SAME base product
+    # Example: "Galaxy S10 DS" should match "Galaxy S10" at 100%
+    s = re.sub(r'\b(dual\s*sim|ds|international|global)\b', '', s, flags=re.IGNORECASE)
+
     # KEEP variant suffixes - these indicate different physical products!
     # "Max", "Plus", "XL", "Pro" are already preserved (not removed)
     # Letter model variants (7X, 7C, 8X) are already preserved (part of tokens)
@@ -868,6 +874,76 @@ def extract_model_tokens(text: str) -> List[str]:
     return model_tokens
 
 
+def extract_model_variant_keywords(text: str) -> Dict[str, any]:
+    """
+    Extract model variant keywords that distinguish different products.
+
+    Returns dict with:
+        'fold_gen': Generation number for Fold (e.g., 'fold2', 'fold3', 'fold6')
+        'flip_gen': Generation number for Flip (e.g., 'flip3', 'flip4', 'flip6')
+        'has_fold': Boolean - is this a Fold product?
+        'has_flip': Boolean - is this a Flip product?
+        'has_pro_max': Boolean - is this Pro Max variant?
+        'has_pro': Boolean - is this Pro (but NOT Pro Max)?
+        'has_plus': Boolean - is this Plus variant?
+        'has_ultra': Boolean - is this Ultra variant?
+        'has_lite': Boolean - is this Lite variant?
+
+    Critical for preventing errors like:
+    - Fold2 matching with Fold4 (different generations!)
+    - Flip matching with Fold (completely different product lines!)
+    - Pro matching with Pro Max (different models!)
+    """
+    text_lower = text.lower()
+    result = {
+        'fold_gen': None,
+        'flip_gen': None,
+        'has_fold': False,
+        'has_flip': False,
+        'has_pro_max': False,
+        'has_pro': False,
+        'has_plus': False,
+        'has_ultra': False,
+        'has_lite': False,
+    }
+
+    # Fold generation (Fold2, Fold3, Fold4, Fold6, Fold7, etc.)
+    if 'fold' in text_lower:
+        result['has_fold'] = True
+        # Look for generation number: "fold 2", "fold2", "z fold 3", "zfold3"
+        fold_match = re.search(r'fold\s*(\d+)', text_lower)
+        if fold_match:
+            result['fold_gen'] = f"fold{fold_match.group(1)}"
+        else:
+            result['fold_gen'] = 'fold'  # Generic Fold without generation
+
+    # Flip generation (Flip3, Flip4, Flip5, Flip6, Flip7, etc.)
+    if 'flip' in text_lower:
+        result['has_flip'] = True
+        # Look for generation number: "flip 3", "flip3", "z flip 4", "zflip4"
+        flip_match = re.search(r'flip\s*(\d+)', text_lower)
+        if flip_match:
+            result['flip_gen'] = f"flip{flip_match.group(1)}"
+        else:
+            result['flip_gen'] = 'flip'  # Generic Flip without generation
+
+    # Pro vs Pro Max (CRITICAL: Check "pro max" first!)
+    if 'pro max' in text_lower:
+        result['has_pro_max'] = True
+    elif 'pro' in text_lower:
+        result['has_pro'] = True
+
+    # Other variants
+    if 'plus' in text_lower:
+        result['has_plus'] = True
+    if 'ultra' in text_lower:
+        result['has_ultra'] = True
+    if 'lite' in text_lower:
+        result['has_lite'] = True
+
+    return result
+
+
 def auto_select_matching_variant(
     user_input: str,
     asset_ids: List[str],
@@ -877,10 +953,12 @@ def auto_select_matching_variant(
     Automatically select the best variant from MULTIPLE_MATCHES based on user's exact specs.
 
     For recommerce: Match what user HAS, not what's 'better'.
-    - If user has 5G, select 5G variant (not 4G)
-    - If user has 4G, select 4G variant (not 5G)
-    - If user specifies a year, select that year (not newer/older)
-    - If truly identical, select first ID
+
+    Priority order (CRITICAL - DO NOT SKIP ANY!):
+    1. Year matching (2024, 2023, etc.)
+    1.5. MODEL VARIANT matching (Fold vs Flip, Fold2 vs Fold3, Pro vs Pro Max) <- ADDED TO FIX ERRORS!
+    2. Connectivity matching (5G vs 4G)
+    3. First ID if truly identical
 
     Returns dict:
         'selected_id': The chosen asset ID
@@ -921,14 +999,109 @@ def auto_select_matching_variant(
         year = user_year.group(1)
         match_year = variants[variants['uae_assetname'].str.contains(year, na=False)]
         if len(match_year) > 0:
-            selected = match_year.iloc[0]['uae_assetid']
-            alternatives = [aid for aid in asset_ids if aid != selected]
-            return {
-                'selected_id': selected,
-                'auto_selected': True,
-                'reason': f'Matched year {year}',
-                'alternatives': alternatives
-            }
+            # Continue to Priority 1.5 with year-filtered variants
+            variants = match_year
+
+    # === PRIORITY 1.5: MODEL VARIANT matching (CRITICAL FIX!) ===
+    # This prevents Fold2 from matching Fold4, and Flip from matching Fold!
+    user_variants = extract_model_variant_keywords(user_input)
+
+    # CRITICAL ERROR PREVENTION 1: Fold vs Flip (completely different product lines!)
+    if user_variants['has_fold'] or user_variants['has_flip']:
+        # Filter to ONLY Fold or ONLY Flip based on what user has
+        filtered = []
+        for _, row in variants.iterrows():
+            nl_variants = extract_model_variant_keywords(row['uae_assetname'])
+
+            # If user has Fold, NL must have Fold (not Flip!)
+            if user_variants['has_fold'] and not nl_variants['has_fold']:
+                continue
+            # If user has Flip, NL must have Flip (not Fold!)
+            if user_variants['has_flip'] and not nl_variants['has_flip']:
+                continue
+
+            filtered.append(row['uae_assetid'])
+
+        if len(filtered) > 0:
+            variants = nl_catalog[nl_catalog['uae_assetid'].isin(filtered)]
+
+    # CRITICAL ERROR PREVENTION 2: Fold/Flip generation matching (Fold2 ≠ Fold3 ≠ Fold4!)
+    if user_variants['fold_gen'] or user_variants['flip_gen']:
+        filtered = []
+        for _, row in variants.iterrows():
+            nl_variants = extract_model_variant_keywords(row['uae_assetname'])
+
+            # If user has specific Fold generation, NL must match EXACTLY
+            if user_variants['fold_gen'] and nl_variants['fold_gen'] != user_variants['fold_gen']:
+                continue
+            # If user has specific Flip generation, NL must match EXACTLY
+            if user_variants['flip_gen'] and nl_variants['flip_gen'] != user_variants['flip_gen']:
+                continue
+
+            filtered.append(row['uae_assetid'])
+
+        if len(filtered) > 0:
+            variants = nl_catalog[nl_catalog['uae_assetid'].isin(filtered)]
+
+    # ERROR PREVENTION 3: Pro vs Pro Max (different models!)
+    if user_variants['has_pro_max'] or user_variants['has_pro']:
+        filtered = []
+        for _, row in variants.iterrows():
+            nl_variants = extract_model_variant_keywords(row['uae_assetname'])
+
+            # If user has Pro Max, NL must have Pro Max (not just Pro)
+            if user_variants['has_pro_max'] and not nl_variants['has_pro_max']:
+                continue
+            # If user has Pro (not Max), NL must NOT have Pro Max
+            if user_variants['has_pro'] and nl_variants['has_pro_max']:
+                continue
+
+            filtered.append(row['uae_assetid'])
+
+        if len(filtered) > 0:
+            variants = nl_catalog[nl_catalog['uae_assetid'].isin(filtered)]
+
+    # ERROR PREVENTION 4: Plus variant matching
+    if user_variants['has_plus']:
+        filtered = []
+        for _, row in variants.iterrows():
+            nl_variants = extract_model_variant_keywords(row['uae_assetname'])
+
+            # If user has Plus, prefer NL with Plus
+            if nl_variants['has_plus']:
+                filtered.append(row['uae_assetid'])
+
+        if len(filtered) > 0:
+            variants = nl_catalog[nl_catalog['uae_assetid'].isin(filtered)]
+
+    # If model variant filtering narrowed down to 1 option, select it!
+    if len(variants) == 1:
+        selected = variants.iloc[0]['uae_assetid']
+        alternatives = [aid for aid in asset_ids if aid != selected]
+
+        # Build reason based on what was matched
+        reason_parts = []
+        if user_year:
+            reason_parts.append(f'year {user_year.group(1)}')
+        if user_variants['fold_gen']:
+            reason_parts.append(f'{user_variants["fold_gen"]}')
+        elif user_variants['flip_gen']:
+            reason_parts.append(f'{user_variants["flip_gen"]}')
+        if user_variants['has_pro_max']:
+            reason_parts.append('Pro Max')
+        elif user_variants['has_pro']:
+            reason_parts.append('Pro')
+        if user_variants['has_plus']:
+            reason_parts.append('Plus')
+
+        reason = f'Matched {", ".join(reason_parts)}' if reason_parts else 'Matched model variant'
+
+        return {
+            'selected_id': selected,
+            'auto_selected': True,
+            'reason': reason,
+            'alternatives': alternatives
+        }
 
     # === PRIORITY 2: Connectivity matching (5G vs 4G/LTE) ===
     user_has_5g = '5g' in user_input.lower()
@@ -1637,10 +1810,11 @@ def _filter_duplicate_custom_configs(df: pd.DataFrame, name_col: str) -> pd.Data
 
 def parse_asset_sheets(file) -> Dict[str, Dict]:
     """
-    Parse all asset-list sheets from an uploaded Excel file.
+    Parse all asset-list sheets from an uploaded Excel or CSV file.
 
     Automatically:
-        - Skips sheets that look like the NL reference
+        - Handles both .xlsx and .csv files
+        - Skips sheets that look like the NL reference (Excel only)
         - Detects the header row (skips title rows)
         - Detects brand and product-name columns
         - Drops the leading empty index column if present
@@ -1651,54 +1825,106 @@ def parse_asset_sheets(file) -> Dict[str, Dict]:
         'name_col': str,
     }
     """
-    xls = pd.ExcelFile(file)
     results = {}
 
-    for sheet_name in xls.sheet_names:
-        if _is_nl_sheet(sheet_name):
-            continue  # Skip NL reference sheets
+    # Check if file is CSV or Excel
+    file_name = getattr(file, 'name', '')
+    is_csv = file_name.lower().endswith('.csv')
 
-        # Detect header row
-        header_row = _detect_header_row(file, sheet_name)
-        df = pd.read_excel(file, sheet_name=sheet_name, header=None, skiprows=header_row + 1)
+    if is_csv:
+        # Handle CSV file (single sheet)
+        try:
+            # Try to read CSV file
+            df = pd.read_csv(file)
 
-        # Read header separately to get column names
-        hdr = pd.read_excel(file, sheet_name=sheet_name, header=None, skiprows=header_row, nrows=1)
-        raw_headers = [str(v).strip() if pd.notna(v) else '' for v in hdr.iloc[0].values]
+            # Get headers
+            raw_headers = [str(v).strip() if pd.notna(v) else '' for v in df.columns]
 
-        # Drop leading empty columns (common pattern: first col is NaN index)
-        while raw_headers and raw_headers[0] in ('', 'nan', 'None'):
-            raw_headers = raw_headers[1:]
-            df = df.iloc[:, 1:]
+            # Drop leading empty columns
+            while raw_headers and raw_headers[0] in ('', 'nan', 'None', 'Unnamed: 0'):
+                raw_headers = raw_headers[1:]
+                df = df.iloc[:, 1:]
 
-        if len(raw_headers) == 0 or len(df.columns) == 0:
-            continue  # Empty sheet
+            if len(raw_headers) == 0 or len(df.columns) == 0:
+                return results  # Empty file
 
-        # Ensure column count matches
-        if len(raw_headers) > len(df.columns):
-            raw_headers = raw_headers[:len(df.columns)]
-        elif len(raw_headers) < len(df.columns):
-            raw_headers += [f'col_{i}' for i in range(len(raw_headers), len(df.columns))]
+            # Update column names
+            df.columns = raw_headers
 
-        df.columns = raw_headers
+            # Detect brand and name columns
+            col_map = _detect_columns(raw_headers)
 
-        # Detect brand and name columns
-        col_map = _detect_columns(raw_headers)
+            if col_map['name_col'] is None:
+                return results  # Can't match without a product name column
 
-        if col_map['name_col'] is None:
-            continue  # Can't match without a product name column
+            # Drop rows where the name column is empty
+            df = df.dropna(subset=[col_map['name_col']])
 
-        # Drop rows where the name column is empty
-        df = df.dropna(subset=[col_map['name_col']])
+            # Smart filter: Remove duplicate "Custom configuration" entries
+            df = _filter_duplicate_custom_configs(df, col_map['name_col'])
 
-        # Smart filter: Remove duplicate "Custom configuration" entries
-        # Keeps unique custom configs, removes obvious placeholders
-        df = _filter_duplicate_custom_configs(df, col_map['name_col'])
+            # Use filename (without extension) as sheet name
+            sheet_name = file_name.rsplit('.', 1)[0] if '.' in file_name else 'Sheet 1'
 
-        results[sheet_name] = {
-            'df': df.reset_index(drop=True),
-            'brand_col': col_map['brand_col'],
-            'name_col': col_map['name_col'],
-        }
+            results[sheet_name] = {
+                'df': df.reset_index(drop=True),
+                'brand_col': col_map['brand_col'],
+                'name_col': col_map['name_col'],
+            }
+
+        except Exception as e:
+            # If CSV parsing fails, return empty results
+            return results
+
+    else:
+        # Handle Excel file (multiple sheets)
+        xls = pd.ExcelFile(file)
+
+        for sheet_name in xls.sheet_names:
+            if _is_nl_sheet(sheet_name):
+                continue  # Skip NL reference sheets
+
+            # Detect header row
+            header_row = _detect_header_row(file, sheet_name)
+            df = pd.read_excel(file, sheet_name=sheet_name, header=None, skiprows=header_row + 1)
+
+            # Read header separately to get column names
+            hdr = pd.read_excel(file, sheet_name=sheet_name, header=None, skiprows=header_row, nrows=1)
+            raw_headers = [str(v).strip() if pd.notna(v) else '' for v in hdr.iloc[0].values]
+
+            # Drop leading empty columns (common pattern: first col is NaN index)
+            while raw_headers and raw_headers[0] in ('', 'nan', 'None'):
+                raw_headers = raw_headers[1:]
+                df = df.iloc[:, 1:]
+
+            if len(raw_headers) == 0 or len(df.columns) == 0:
+                continue  # Empty sheet
+
+            # Ensure column count matches
+            if len(raw_headers) > len(df.columns):
+                raw_headers = raw_headers[:len(df.columns)]
+            elif len(raw_headers) < len(df.columns):
+                raw_headers += [f'col_{i}' for i in range(len(raw_headers), len(df.columns))]
+
+            df.columns = raw_headers
+
+            # Detect brand and name columns
+            col_map = _detect_columns(raw_headers)
+
+            if col_map['name_col'] is None:
+                continue  # Can't match without a product name column
+
+            # Drop rows where the name column is empty
+            df = df.dropna(subset=[col_map['name_col']])
+
+            # Smart filter: Remove duplicate "Custom configuration" entries
+            # Keeps unique custom configs, removes obvious placeholders
+            df = _filter_duplicate_custom_configs(df, col_map['name_col'])
+
+            results[sheet_name] = {
+                'df': df.reset_index(drop=True),
+                'brand_col': col_map['brand_col'],
+                'name_col': col_map['name_col'],
+            }
 
     return results
