@@ -59,10 +59,10 @@ st.sidebar.header("⚙️ Settings")
 # Fixed threshold at 85% - hybrid matching with auto-select handles everything
 threshold = SIMILARITY_THRESHOLD
 
-st.sidebar.markdown("**Match Status:**")
-st.sidebar.markdown("🟢 **MATCHED** — Confident match with single ID (auto-selected if needed)")
-st.sidebar.markdown("🟡 **REVIEW REQUIRED** — Needs manual review (score 85-94%, attributes differ)")
-st.sidebar.markdown("🔴 **NO_MATCH** — No confident match found (score < 85%)")
+st.sidebar.markdown("**Confidence Tiers:**")
+st.sidebar.markdown("🟢 **HIGH (≥90%)** — MATCHED status (auto-selected if multiple variants)")
+st.sidebar.markdown("🟡 **MEDIUM (85-89%)** — REVIEW REQUIRED (attributes differ)")
+st.sidebar.markdown("🔴 **LOW (<85%)** — NO_MATCH (no confident match found)")
 
 # Admin: refresh NL reference (hidden in sidebar expander)
 with st.sidebar.expander("Admin: NL Reference"):
@@ -141,7 +141,7 @@ st.success(
 # =========================================================================
 # Tab Navigation
 # =========================================================================
-tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "🔗 Mapping", "🎯 Variant Selector"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard", "🔗 Mapping", "🎯 Variant Selector", "❌ Unmatched Analysis"])
 
 # =========================================================================
 # TAB 1: DASHBOARD
@@ -413,76 +413,130 @@ if asset_upload is not None:
                         )
 
         # ------------------------------------------------------------------
-        # Output Excel
+        # Store results in session state for cross-tab access
+        # ------------------------------------------------------------------
+        st.session_state['mapping_results'] = {
+            'all_results': all_results,
+            'detected_sheets': detected_sheets,
+        }
+
+        # ------------------------------------------------------------------
+        # Output Excel with new structure
         # ------------------------------------------------------------------
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            # 1. MATCHED sheets (one per uploaded sheet) - Only MATCHED items
             for sheet_name, df_result in all_results.items():
-                safe_name = f"{sheet_name} - Mapped"[:31]
-                df_result.to_excel(writer, sheet_name=safe_name, index=False)
+                matched = df_result[df_result['match_status'] == MATCH_STATUS_MATCHED]
+                if len(matched) > 0:
+                    safe_name = f"{sheet_name} - Matched"[:31]
+                    matched.to_excel(writer, sheet_name=safe_name, index=False)
 
-            summary_rows = []
+            # 2. UNMATCHED sheets (one per uploaded sheet) - Only NO_MATCH items
             for sheet_name, df_result in all_results.items():
-                total = len(df_result)
-                matched = int((df_result['match_status'] == MATCH_STATUS_MATCHED).sum())
-                suggested = int((df_result['match_status'] == MATCH_STATUS_SUGGESTED).sum())
-                multiple = int((df_result['match_status'] == MATCH_STATUS_MULTIPLE).sum())
-                no_match = int((df_result['match_status'] == MATCH_STATUS_NO_MATCH).sum())
-                summary_rows.append({
-                    'Sheet': sheet_name, 'Total': total,
-                    'Matched (HIGH)': matched, 'Review Required': suggested,
-                    'Multiple IDs': multiple, 'No Match': no_match,
-                    'Auto-Apply Rate': f"{matched/total*100:.2f}%",
-                })
-            summary_rows.append({'Sheet': '', 'Total': '', 'Matched (HIGH)': '', 'Review Required': '', 'Multiple IDs': '', 'No Match': '', 'Auto-Apply Rate': ''})
-            summary_rows.append({
-                'Sheet': 'NL Reference', 'Total': nl_stats.get('final', len(df_nl_clean)),
-                'Matched (HIGH)': '', 'Review Required': '', 'Multiple IDs': '', 'No Match': '',
-                'Auto-Apply Rate': f"Auto-accept >= {HIGH_CONFIDENCE_THRESHOLD}%",
-            })
-            pd.DataFrame(summary_rows).to_excel(writer, sheet_name='Summary', index=False)
-
-            for sheet_name, df_result in all_results.items():
-                suggested = df_result[df_result['match_status'] == MATCH_STATUS_SUGGESTED]
-                if len(suggested) > 0:
-                    safe_name = f"{sheet_name} - Review"[:31]
-                    suggested.to_excel(writer, sheet_name=safe_name, index=False)
                 unmatched = df_result[df_result['match_status'] == MATCH_STATUS_NO_MATCH]
                 if len(unmatched) > 0:
                     safe_name = f"{sheet_name} - Unmatched"[:31]
                     unmatched.to_excel(writer, sheet_name=safe_name, index=False)
 
-            # Add variant details for MULTIPLE_MATCHES items
-            variant_details = []
+            # 3. REVIEW REQUIRED sheet - All REVIEW_REQUIRED items (combined)
+            all_review_required = []
             for sheet_name, df_result in all_results.items():
-                multiple = df_result[df_result['match_status'] == MATCH_STATUS_MULTIPLE]
-                for idx, row in multiple.iterrows():
+                review = df_result[df_result['match_status'] == MATCH_STATUS_SUGGESTED].copy()
+                if len(review) > 0:
+                    review.insert(0, 'Source Sheet', sheet_name)
+                    all_review_required.append(review)
+
+            if all_review_required:
+                df_review_combined = pd.concat(all_review_required, ignore_index=True)
+                df_review_combined.to_excel(writer, sheet_name='Review Required', index=False)
+
+            # 4. AUTO-SELECTED PRODUCTS sheet - All auto-selected items with details
+            auto_selected_details = []
+            for sheet_name, df_result in all_results.items():
+                auto_selected = df_result[df_result['auto_selected'] == True].copy()
+                for idx, row in auto_selected.iterrows():
                     # Get original product name
                     name_col = 'name' if 'name' in row else 'Foxway Product Name'
-                    original_name = row[name_col]
+                    original_name = row[name_col] if name_col in row else ''
 
-                    # Split comma-separated IDs
-                    ids = str(row['mapped_uae_assetid']).split(',')
-                    ids = [id.strip() for id in ids]
+                    # Parse alternatives
+                    alternatives_raw = row.get('alternatives', '')
+                    if isinstance(alternatives_raw, str) and alternatives_raw:
+                        try:
+                            alternatives = eval(alternatives_raw) if alternatives_raw.startswith('[') else []
+                        except:
+                            alternatives = []
+                    else:
+                        alternatives = []
 
-                    # Look up each ID in NL catalog to get full product name
-                    for id_val in ids:
-                        nl_entry = df_nl_clean[df_nl_clean['uae_assetid'] == id_val]
-                        if len(nl_entry) > 0:
-                            variant_details.append({
-                                'Sheet': sheet_name,
-                                'Your Product': original_name,
-                                'Matched To': row['matched_on'],
-                                'Match Score': f"{row['match_score']:.1f}%",
-                                'Variant ID': id_val,
-                                'NL Product Name': nl_entry.iloc[0]['uae_assetname'],
-                                'Category': nl_entry.iloc[0]['category'],
-                                'Brand': nl_entry.iloc[0]['brand'],
-                            })
+                    # Get selected product details from NL catalog
+                    selected_id = row['mapped_uae_assetid']
+                    nl_entry = df_nl_clean[df_nl_clean['uae_assetid'] == selected_id]
+                    selected_name = nl_entry.iloc[0]['uae_assetname'] if len(nl_entry) > 0 else 'N/A'
 
-            if variant_details:
-                df_variants = pd.DataFrame(variant_details)
-                df_variants.to_excel(writer, sheet_name='Multiple ID Variants', index=False)
+                    auto_selected_details.append({
+                        'Source Sheet': sheet_name,
+                        'Your Product': original_name,
+                        'Matched To': row['matched_on'],
+                        'Match Score': f"{row['match_score']:.1f}%",
+                        'Selected ID': selected_id,
+                        'Selected Product': selected_name,
+                        'Selection Reason': row.get('selection_reason', 'N/A'),
+                        'Alternative IDs': ', '.join(alternatives) if alternatives else 'None',
+                        'Total Variants': len(alternatives) + 1,
+                    })
+
+            if auto_selected_details:
+                df_auto_selected = pd.DataFrame(auto_selected_details)
+                df_auto_selected.to_excel(writer, sheet_name='Auto-Selected Products', index=False)
+
+            # 5. SUMMARY sheet - Overall statistics
+            summary_rows = []
+            for sheet_name, df_result in all_results.items():
+                total = len(df_result)
+                matched = int((df_result['match_status'] == MATCH_STATUS_MATCHED).sum())
+                review = int((df_result['match_status'] == MATCH_STATUS_SUGGESTED).sum())
+                no_match = int((df_result['match_status'] == MATCH_STATUS_NO_MATCH).sum())
+                auto_selected = int(df_result['auto_selected'].sum())
+
+                summary_rows.append({
+                    'Sheet': sheet_name,
+                    'Total Items': total,
+                    'Matched': matched,
+                    'Review Required': review,
+                    'No Match': no_match,
+                    'Auto-Selected': auto_selected,
+                    'Match Rate': f"{matched/total*100:.1f}%",
+                })
+
+            # Add totals row
+            total_items = sum(len(df) for df in all_results.values())
+            total_matched = sum((df['match_status'] == MATCH_STATUS_MATCHED).sum() for df in all_results.values())
+            total_review = sum((df['match_status'] == MATCH_STATUS_SUGGESTED).sum() for df in all_results.values())
+            total_no_match = sum((df['match_status'] == MATCH_STATUS_NO_MATCH).sum() for df in all_results.values())
+            total_auto_selected = sum(df['auto_selected'].sum() for df in all_results.values())
+
+            summary_rows.append({
+                'Sheet': '',
+                'Total Items': '',
+                'Matched': '',
+                'Review Required': '',
+                'No Match': '',
+                'Auto-Selected': '',
+                'Match Rate': '',
+            })
+            summary_rows.append({
+                'Sheet': 'TOTAL',
+                'Total Items': int(total_items),
+                'Matched': int(total_matched),
+                'Review Required': int(total_review),
+                'No Match': int(total_no_match),
+                'Auto-Selected': int(total_auto_selected),
+                'Match Rate': f"{total_matched/total_items*100:.1f}%",
+            })
+
+            pd.DataFrame(summary_rows).to_excel(writer, sheet_name='Summary', index=False)
 
         output.seek(0)
 
@@ -505,73 +559,181 @@ with tab3:
     st.markdown("""
     Review and override auto-selected variants. The system automatically selects the best variant based on
     your product's specs (year, 5G/4G), but you can manually choose a different variant if needed.
-
-    Upload your latest mapping results from the **Mapping** tab to review auto-selections.
     """)
 
-    # Upload results file
-    results_upload = st.file_uploader("📁 Upload Mapping Results (.xlsx)", type=["xlsx"], key="results_upload")
+    # Check if mapping results exist in session state
+    if 'mapping_results' not in st.session_state:
+        st.info("ℹ️ No mapping results available. Please run the **Mapping** tab first.")
+        st.stop()
 
-    if results_upload is not None:
-        try:
-            # Load all sheets
-            df_l1_mapped = pd.read_excel(results_upload, sheet_name='List 1 - Mapped')
-            df_l2_mapped = pd.read_excel(results_upload, sheet_name=' List 2 - Mapped')
+    # Load results from session state
+    all_results = st.session_state['mapping_results']['all_results']
+    detected_sheets = st.session_state['mapping_results']['detected_sheets']
 
-            # Find auto-selected items (these have alternatives to choose from)
-            l1_autoselect = df_l1_mapped[df_l1_mapped['auto_selected'] == True]
-            l2_autoselect = df_l2_mapped[df_l2_mapped['auto_selected'] == True]
+    # Convert results dict to separate dataframes
+    all_dataframes = {}
+    for sheet_name, df_result in all_results.items():
+        all_dataframes[sheet_name] = df_result.copy()
 
-            total_autoselect = len(l1_autoselect) + len(l2_autoselect)
+    # Find auto-selected items
+    all_auto_selected = []
+    for sheet_name, df_result in all_dataframes.items():
+        auto_selected = df_result[df_result['auto_selected'] == True]
+        if len(auto_selected) > 0:
+            all_auto_selected.append((sheet_name, auto_selected))
 
-            if total_autoselect == 0:
-                st.info("ℹ️ No auto-selected variants found. All items have single unique IDs.")
-                st.stop()
+    total_autoselect = sum(len(df) for _, df in all_auto_selected)
 
-            # Show stats
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Auto-Selected Items", total_autoselect)
-            with col2:
-                st.metric("List 1", len(l1_autoselect))
-            with col3:
-                st.metric("List 2", len(l2_autoselect))
+    if total_autoselect == 0:
+        st.info("ℹ️ No auto-selected variants found. All matched items have single unique IDs.")
+        st.stop()
 
-            st.divider()
+    # ------------------------------------------------------------------
+    # ACCURACY VERIFICATION
+    # ------------------------------------------------------------------
+    st.subheader("🎯 Auto-Selection Accuracy")
 
+    with st.spinner("Verifying accuracy of auto-selected items..."):
+        errors = []
+        warnings = []
+        success_count = 0
+
+        for sheet_name, auto_selected in all_auto_selected:
+            for idx, row in auto_selected.iterrows():
+                # Get product name
+                name_col = 'name' if 'name' in row else 'Foxway Product Name'
+                user_input = str(row[name_col]) if name_col in row else ''
+
+                selected_id = row['mapped_uae_assetid']
+                selection_reason = row.get('selection_reason', '')
+
+                # CHECK 1: Selected ID exists in NL catalog
+                nl_entry = df_nl_clean[df_nl_clean['uae_assetid'] == selected_id]
+                if len(nl_entry) == 0:
+                    errors.append({
+                        'sheet': sheet_name,
+                        'product': user_input,
+                        'error': f'Selected ID {selected_id} not found in NL catalog',
+                    })
+                    continue
+
+                nl_product = nl_entry.iloc[0]['uae_assetname']
+
+                # CHECK 2: Verify selection reason is logical
+                reason = str(selection_reason).lower()
+                user_input_lower = user_input.lower()
+                nl_product_lower = nl_product.lower()
+
+                # Check year matching
+                if 'matched year' in reason:
+                    import re
+                    year_match = re.search(r'matched year (\d{4})', reason)
+                    if year_match:
+                        year = year_match.group(1)
+                        if year not in nl_product_lower:
+                            errors.append({
+                                'sheet': sheet_name,
+                                'product': user_input,
+                                'error': f"Reason says 'matched year {year}' but year not in selected product",
+                            })
+                            continue
+
+                # Check 5G matching
+                elif 'matched 5g' in reason:
+                    if '5g' not in user_input_lower:
+                        errors.append({
+                            'sheet': sheet_name,
+                            'product': user_input,
+                            'error': "Reason says 'matched 5G' but user input has no 5G",
+                        })
+                        continue
+                    if '5g' not in nl_product_lower:
+                        errors.append({
+                            'sheet': sheet_name,
+                            'product': user_input,
+                            'error': "Reason says 'matched 5G' but selected product has no 5G",
+                        })
+                        continue
+
+                # Check 4G/LTE matching
+                elif 'matched 4g/lte' in reason or 'defaulted to 4g' in reason:
+                    if '5g' in nl_product_lower:
+                        errors.append({
+                            'sheet': sheet_name,
+                            'product': user_input,
+                            'error': "Reason says '4G/LTE' but selected product has 5G",
+                        })
+                        continue
+
+                success_count += 1
+
+    # Display accuracy metrics
+    accuracy = (success_count / total_autoselect * 100) if total_autoselect > 0 else 100
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Total Auto-Selected", total_autoselect)
+    with col2:
+        st.metric("Verified Correct", success_count, delta=None if accuracy == 100 else f"-{len(errors)}")
+    with col3:
+        accuracy_color = "🟢" if accuracy == 100 else "🟡" if accuracy >= 95 else "🔴"
+        st.metric(f"{accuracy_color} Accuracy", f"{accuracy:.1f}%")
+    with col4:
+        st.metric("Errors Found", len(errors), delta=None if len(errors) == 0 else "needs review")
+
+    if accuracy == 100:
+        st.success("✅ **Perfect accuracy!** All auto-selections are verified correct. Manual override not necessary.")
+        st.caption("All selected IDs exist in NL catalog and selection reasons are logical.")
+    else:
+        st.warning(f"⚠️ Found {len(errors)} error(s) in auto-selections. Manual review recommended.")
+
+        with st.expander("View errors"):
+            for i, err in enumerate(errors, 1):
+                st.markdown(f"{i}. **[{err['sheet']}]** {err['product']}")
+                st.caption(f"   ❌ {err['error']}")
+
+    st.divider()
+
+    # ------------------------------------------------------------------
+    # VARIANT OVERRIDE SECTION (only if accuracy < 100%)
+    # ------------------------------------------------------------------
+    if accuracy < 100:
+        st.subheader("🔧 Manual Override")
+        st.markdown("Since accuracy is below 100%, you can manually override auto-selections below.")
+
+        if True:
             # Interactive selector
-            st.subheader("Review Auto-Selected Variants")
             st.caption("✓ Auto-selection logic: Year → Connectivity (5G/4G) → First ID")
 
             # Initialize session state for selections
             if 'variant_selections' not in st.session_state:
                 st.session_state.variant_selections = {}
 
-            # Combine all auto-selected items
-            all_autoselect = []
-            for idx, row in l1_autoselect.iterrows():
-                all_autoselect.append(('List 1', idx, row))
-            for idx, row in l2_autoselect.iterrows():
-                all_autoselect.append(('List 2', idx, row))
+            # Flatten all auto-selected items for display
+            all_items_flat = []
+            for sheet_name, auto_selected in all_auto_selected:
+                for idx, row in auto_selected.iterrows():
+                    all_items_flat.append((sheet_name, idx, row))
 
             # Show items with variant selection
-            st.markdown(f"**Showing {min(20, len(all_autoselect))} of {len(all_autoselect)} items** (first 20 for demo)")
+            st.markdown(f"**Showing first {min(20, len(all_items_flat))} of {len(all_items_flat)} items**")
 
-            for i, (sheet, idx, row) in enumerate(all_autoselect[:20]):
-                with st.expander(f"Item {i+1}: {row.get('name', row.get('Foxway Product Name', ''))}"):
+            for i, (sheet_name, idx, row) in enumerate(all_items_flat[:20]):
+                name_col = 'name' if 'name' in row else 'Foxway Product Name'
+                product_name = row[name_col] if name_col in row else ''
+
+                with st.expander(f"Item {i+1}: {product_name}"):
                     # Show match info
                     col_info, col_select = st.columns([2, 1])
 
                     with col_info:
-                        st.markdown(f"**Your Product:** {row.get('name', row.get('Foxway Product Name', ''))}")
+                        st.markdown(f"**Your Product:** {product_name}")
                         st.markdown(f"**Matched To:** `{row['matched_on']}`")
                         st.markdown(f"**Match Score:** {row['match_score']:.1f}%")
                         st.markdown(f"**Selection Reason:** {row.get('selection_reason', 'N/A')}")
 
-                    # Parse alternatives (stored as list in Excel)
+                    # Parse alternatives
                     current_id = str(row['mapped_uae_assetid']).strip()
-
-                    # Get alternatives from the alternatives column
                     alternatives_raw = row.get('alternatives', '')
                     if isinstance(alternatives_raw, str) and alternatives_raw:
                         try:
@@ -587,18 +749,16 @@ with tab3:
                     # Show variant options
                     st.markdown(f"**{len(all_ids)} Variant Options:**")
 
-                    variant_options = []
                     for id_val in all_ids:
                         nl_entry = df_nl_clean[df_nl_clean['uae_assetid'] == id_val]
                         if len(nl_entry) > 0:
-                            product_name = nl_entry.iloc[0]['uae_assetname']
+                            product_name_nl = nl_entry.iloc[0]['uae_assetname']
                             prefix = "✓ **SELECTED:** " if id_val == current_id else "   "
-                            variant_options.append(f"{id_val}: {product_name}")
-                            st.markdown(f"{prefix}`{id_val}`: {product_name}")
+                            st.markdown(f"{prefix}`{id_val}`: {product_name_nl}")
 
                     # Selection dropdown
                     with col_select:
-                        key = f"{sheet}_{idx}"
+                        key = f"{sheet_name}_{idx}"
                         selected = st.selectbox(
                             "Override selection:",
                             options=range(len(all_ids)),
@@ -614,34 +774,139 @@ with tab3:
 
             st.divider()
 
-            # Apply selections button
-            if st.button("✅ Apply Overrides & Download", type="primary", use_container_width=True):
-                # Count overrides
+            # Apply selections and generate updated Excel
+            if st.button("✅ Apply Overrides & Download Updated Results", type="primary", use_container_width=True):
                 override_count = 0
 
-                # Apply selections to dataframes
+                # Apply overrides to session state data
                 for key, selected_id in st.session_state.variant_selections.items():
-                    sheet, idx_str = key.split('_', 1)
-                    idx = int(idx_str)
+                    parts = key.rsplit('_', 1)
+                    if len(parts) == 2:
+                        sheet_name, idx_str = parts
+                        idx = int(idx_str)
 
-                    if sheet == 'List 1':
-                        original_id = df_l1_mapped.at[idx, 'mapped_uae_assetid']
-                        if str(selected_id) != str(original_id):
-                            df_l1_mapped.at[idx, 'mapped_uae_assetid'] = selected_id
-                            df_l1_mapped.at[idx, 'selection_reason'] = 'Manually overridden'
-                            override_count += 1
-                    else:
-                        original_id = df_l2_mapped.at[idx, 'mapped_uae_assetid']
-                        if str(selected_id) != str(original_id):
-                            df_l2_mapped.at[idx, 'mapped_uae_assetid'] = selected_id
-                            df_l2_mapped.at[idx, 'selection_reason'] = 'Manually overridden'
-                            override_count += 1
+                        if sheet_name in all_dataframes:
+                            original_id = all_dataframes[sheet_name].at[idx, 'mapped_uae_assetid']
+                            if str(selected_id) != str(original_id):
+                                all_dataframes[sheet_name].at[idx, 'mapped_uae_assetid'] = selected_id
+                                all_dataframes[sheet_name].at[idx, 'selection_reason'] = 'Manually overridden'
+                                override_count += 1
 
-                # Generate output Excel
+                # Update session state with modified data
+                st.session_state['mapping_results']['all_results'] = all_dataframes
+
+                # Generate updated Excel with new structure
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    df_l1_mapped.to_excel(writer, sheet_name='List 1 - Mapped', index=False)
-                    df_l2_mapped.to_excel(writer, sheet_name=' List 2 - Mapped', index=False)
+                    # 1. MATCHED sheets (updated with overrides)
+                    for sheet_name, df_result in all_dataframes.items():
+                        matched = df_result[df_result['match_status'] == MATCH_STATUS_MATCHED]
+                        if len(matched) > 0:
+                            safe_name = f"{sheet_name} - Matched"[:31]
+                            matched.to_excel(writer, sheet_name=safe_name, index=False)
+
+                    # 2. UNMATCHED sheets
+                    for sheet_name, df_result in all_dataframes.items():
+                        unmatched = df_result[df_result['match_status'] == MATCH_STATUS_NO_MATCH]
+                        if len(unmatched) > 0:
+                            safe_name = f"{sheet_name} - Unmatched"[:31]
+                            unmatched.to_excel(writer, sheet_name=safe_name, index=False)
+
+                    # 3. REVIEW REQUIRED sheet
+                    all_review_required = []
+                    for sheet_name, df_result in all_dataframes.items():
+                        review = df_result[df_result['match_status'] == MATCH_STATUS_SUGGESTED].copy()
+                        if len(review) > 0:
+                            review.insert(0, 'Source Sheet', sheet_name)
+                            all_review_required.append(review)
+
+                    if all_review_required:
+                        df_review_combined = pd.concat(all_review_required, ignore_index=True)
+                        df_review_combined.to_excel(writer, sheet_name='Review Required', index=False)
+
+                    # 4. AUTO-SELECTED PRODUCTS sheet (with overrides marked)
+                    auto_selected_details = []
+                    for sheet_name, df_result in all_dataframes.items():
+                        auto_selected = df_result[df_result['auto_selected'] == True].copy()
+                        for idx, row in auto_selected.iterrows():
+                            name_col = 'name' if 'name' in row else 'Foxway Product Name'
+                            original_name = row[name_col] if name_col in row else ''
+
+                            alternatives_raw = row.get('alternatives', '')
+                            if isinstance(alternatives_raw, str) and alternatives_raw:
+                                try:
+                                    alternatives = eval(alternatives_raw) if alternatives_raw.startswith('[') else []
+                                except:
+                                    alternatives = []
+                            else:
+                                alternatives = []
+
+                            selected_id = row['mapped_uae_assetid']
+                            nl_entry = df_nl_clean[df_nl_clean['uae_assetid'] == selected_id]
+                            selected_name = nl_entry.iloc[0]['uae_assetname'] if len(nl_entry) > 0 else 'N/A'
+
+                            auto_selected_details.append({
+                                'Source Sheet': sheet_name,
+                                'Your Product': original_name,
+                                'Matched To': row['matched_on'],
+                                'Match Score': f"{row['match_score']:.1f}%",
+                                'Selected ID': selected_id,
+                                'Selected Product': selected_name,
+                                'Selection Reason': row.get('selection_reason', 'N/A'),
+                                'Alternative IDs': ', '.join(alternatives) if alternatives else 'None',
+                                'Total Variants': len(alternatives) + 1,
+                            })
+
+                    if auto_selected_details:
+                        df_auto_selected = pd.DataFrame(auto_selected_details)
+                        df_auto_selected.to_excel(writer, sheet_name='Auto-Selected Products', index=False)
+
+                    # 5. SUMMARY sheet
+                    summary_rows = []
+                    for sheet_name, df_result in all_dataframes.items():
+                        total = len(df_result)
+                        matched = int((df_result['match_status'] == MATCH_STATUS_MATCHED).sum())
+                        review = int((df_result['match_status'] == MATCH_STATUS_SUGGESTED).sum())
+                        no_match = int((df_result['match_status'] == MATCH_STATUS_NO_MATCH).sum())
+                        auto_selected_count = int(df_result['auto_selected'].sum())
+
+                        summary_rows.append({
+                            'Sheet': sheet_name,
+                            'Total Items': total,
+                            'Matched': matched,
+                            'Review Required': review,
+                            'No Match': no_match,
+                            'Auto-Selected': auto_selected_count,
+                            'Match Rate': f"{matched/total*100:.1f}%",
+                        })
+
+                    # Add totals
+                    total_items = sum(len(df) for df in all_dataframes.values())
+                    total_matched = sum((df['match_status'] == MATCH_STATUS_MATCHED).sum() for df in all_dataframes.values())
+                    total_review = sum((df['match_status'] == MATCH_STATUS_SUGGESTED).sum() for df in all_dataframes.values())
+                    total_no_match = sum((df['match_status'] == MATCH_STATUS_NO_MATCH).sum() for df in all_dataframes.values())
+                    total_auto_selected = sum(df['auto_selected'].sum() for df in all_dataframes.values())
+
+                    summary_rows.append({
+                        'Sheet': '',
+                        'Total Items': '',
+                        'Matched': '',
+                        'Review Required': '',
+                        'No Match': '',
+                        'Auto-Selected': '',
+                        'Match Rate': '',
+                    })
+                    summary_rows.append({
+                        'Sheet': 'TOTAL',
+                        'Total Items': int(total_items),
+                        'Matched': int(total_matched),
+                        'Review Required': int(total_review),
+                        'No Match': int(total_no_match),
+                        'Auto-Selected': int(total_auto_selected),
+                        'Match Rate': f"{total_matched/total_items*100:.1f}%",
+                    })
+
+                    pd.DataFrame(summary_rows).to_excel(writer, sheet_name='Summary', index=False)
 
                 output.seek(0)
 
@@ -655,12 +920,209 @@ with tab3:
                 )
 
                 if override_count > 0:
-                    st.success(f"✅ Applied {override_count} manual override(s)!")
+                    st.success(f"✅ Applied {override_count} manual override(s)! Updated Excel includes all changes.")
                 else:
-                    st.info("ℹ️ No overrides made. All auto-selections kept.")
+                    st.info("ℹ️ No overrides made. Downloaded Excel matches original mapping results.")
 
-        except Exception as e:
-            st.error(f"Error loading results: {e}")
+    else:
+        st.info("✅ Since accuracy is 100%, manual override is not necessary. All auto-selections are correct!")
+        st.caption("You can still download the results from the Mapping tab.")
+
+# =========================================================================
+# TAB 4: UNMATCHED ANALYSIS
+# =========================================================================
+with tab4:
+    st.header("❌ Unmatched Analysis")
+    st.markdown("""
+    Analyze why items failed to match. This helps identify missing products in the NL catalog,
+    data quality issues, or products that need manual review.
+    """)
+
+    # Check if mapping results exist in session state
+    if 'mapping_results' not in st.session_state:
+        st.info("ℹ️ No mapping results available. Please run the **Mapping** tab first.")
+        st.stop()
+
+    # Load results from session state
+    all_results = st.session_state['mapping_results']['all_results']
+    detected_sheets = st.session_state['mapping_results']['detected_sheets']
+
+    # Combine all NO_MATCH and REVIEW_REQUIRED items
+    unmatched_items = []
+    review_items = []
+
+    for sheet_name, df_result in all_results.items():
+        no_match = df_result[df_result['match_status'] == MATCH_STATUS_NO_MATCH].copy()
+        if len(no_match) > 0:
+            no_match.insert(0, 'Source Sheet', sheet_name)
+            unmatched_items.append(no_match)
+
+        review = df_result[df_result['match_status'] == MATCH_STATUS_SUGGESTED].copy()
+        if len(review) > 0:
+            review.insert(0, 'Source Sheet', sheet_name)
+            review_items.append(review)
+
+    if not unmatched_items and not review_items:
+        st.success("🎉 Perfect! All items matched successfully. Nothing to analyze.")
+        st.stop()
+
+    # Show overview metrics
+    total_unmatched = sum(len(df) for df in unmatched_items)
+    total_review = sum(len(df) for df in review_items)
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("No Match Items", total_unmatched)
+    with col2:
+        st.metric("Review Required Items", total_review)
+    with col3:
+        st.metric("Total Issues", total_unmatched + total_review)
+
+    st.divider()
+
+    # ANALYSIS 1: NO_MATCH Items
+    if unmatched_items:
+        st.subheader("🔴 No Match Analysis (Score < 85%)")
+
+        df_unmatched = pd.concat(unmatched_items, ignore_index=True)
+
+        # Identify name column
+        name_col = 'name' if 'name' in df_unmatched.columns else 'Foxway Product Name'
+        brand_col = 'brand' if 'brand' in df_unmatched.columns else None
+
+        # Breakdown by reason
+        st.markdown("**Why did these items fail to match?**")
+
+        analysis_tabs = st.tabs(["📊 Overview", "🏢 Brand Analysis", "📉 Score Distribution", "📋 Details"])
+
+        with analysis_tabs[0]:  # Overview
+            st.markdown(f"**Total unmatched items:** {len(df_unmatched):,}")
+
+            # Score distribution
+            if 'match_score' in df_unmatched.columns:
+                st.markdown("**Score Distribution:**")
+                score_ranges = {
+                    '80-84%': ((df_unmatched['match_score'] >= 80) & (df_unmatched['match_score'] < 85)).sum(),
+                    '70-79%': ((df_unmatched['match_score'] >= 70) & (df_unmatched['match_score'] < 80)).sum(),
+                    '60-69%': ((df_unmatched['match_score'] >= 60) & (df_unmatched['match_score'] < 70)).sum(),
+                    'Below 60%': (df_unmatched['match_score'] < 60).sum(),
+                }
+
+                for range_label, count in score_ranges.items():
+                    if count > 0:
+                        st.markdown(f"- **{range_label}**: {count:,} items ({count/len(df_unmatched)*100:.1f}%)")
+                        if range_label == '80-84%':
+                            st.caption("   → Very close to threshold (85%). May need slight naming adjustments.")
+                        elif range_label == 'Below 60%':
+                            st.caption("   → Likely not in catalog or significantly different naming.")
+
+        with analysis_tabs[1]:  # Brand Analysis
+            st.markdown("**Brand Presence Check:**")
+
+            # Check which brands exist in NL catalog
+            if brand_col and brand_col in df_unmatched.columns:
+                unique_brands = df_unmatched[brand_col].unique()
+                brand_analysis = []
+
+                for brand in unique_brands:
+                    brand_items = df_unmatched[df_unmatched[brand_col] == brand]
+                    in_catalog = brand in df_nl_clean['brand'].values
+
+                    brand_analysis.append({
+                        'Brand': brand,
+                        'Unmatched Items': len(brand_items),
+                        'In NL Catalog': '✅ Yes' if in_catalog else '❌ No',
+                        'Status': 'Products may be missing' if in_catalog else 'Brand not in catalog',
+                    })
+
+                df_brand_analysis = pd.DataFrame(brand_analysis).sort_values('Unmatched Items', ascending=False)
+                st.dataframe(df_brand_analysis, use_container_width=True, hide_index=True)
+
+                # Highlight brands not in catalog
+                missing_brands = df_brand_analysis[df_brand_analysis['In NL Catalog'] == '❌ No']
+                if len(missing_brands) > 0:
+                    st.warning(f"⚠️ **{len(missing_brands)} brand(s) not found in NL catalog**. These products cannot be matched:")
+                    st.dataframe(missing_brands[['Brand', 'Unmatched Items']], use_container_width=True, hide_index=True)
+            else:
+                st.info("Brand information not available for analysis.")
+
+        with analysis_tabs[2]:  # Score Distribution
+            if 'match_score' in df_unmatched.columns:
+                st.markdown("**Match Score Distribution:**")
+
+                # Show histogram
+                score_data = df_unmatched['match_score'].dropna()
+                if len(score_data) > 0:
+                    st.bar_chart(score_data.value_counts().sort_index())
+
+                    # Show close misses (80-84%)
+                    close_misses = df_unmatched[(df_unmatched['match_score'] >= 80) & (df_unmatched['match_score'] < 85)]
+                    if len(close_misses) > 0:
+                        st.markdown(f"**🎯 Close Misses (80-84%):** {len(close_misses)} items")
+                        st.caption("These items are very close to matching. Check for:")
+                        st.caption("- Minor spelling differences")
+                        st.caption("- Extra/missing words")
+                        st.caption("- Different formatting")
+
+                        with st.expander(f"View {len(close_misses)} close miss items"):
+                            display_cols = ['Source Sheet', name_col, 'match_score', 'matched_on']
+                            display_cols = [col for col in display_cols if col in close_misses.columns]
+                            st.dataframe(close_misses[display_cols], use_container_width=True, hide_index=True)
+
+        with analysis_tabs[3]:  # Details
+            st.markdown("**All Unmatched Items:**")
+            display_cols = ['Source Sheet', name_col, 'match_score', 'matched_on']
+            if brand_col and brand_col in df_unmatched.columns:
+                display_cols.insert(2, brand_col)
+            display_cols = [col for col in display_cols if col in df_unmatched.columns]
+
+            st.dataframe(df_unmatched[display_cols], use_container_width=True, hide_index=True)
+
+    # ANALYSIS 2: REVIEW REQUIRED Items
+    if review_items:
+        st.divider()
+        st.subheader("🟡 Review Required Analysis (Score 85-89%)")
+
+        df_review = pd.concat(review_items, ignore_index=True)
+
+        # Identify name column
+        name_col = 'name' if 'name' in df_review.columns else 'Foxway Product Name'
+
+        st.markdown(f"**Total items needing review:** {len(df_review):,}")
+        st.caption("These items have good similarity scores but attributes (model/storage) don't match exactly.")
+
+        # Show sample of review items
+        with st.expander(f"View {len(df_review)} review required items"):
+            display_cols = ['Source Sheet', name_col, 'match_score', 'matched_on', 'mapped_uae_assetid']
+            display_cols = [col for col in display_cols if col in df_review.columns]
+            st.dataframe(df_review[display_cols], use_container_width=True, hide_index=True)
+
+        st.markdown("**Why review is needed:**")
+        st.markdown("- Match score is good (85-89%) but attributes differ")
+        st.markdown("- Model tokens or storage values don't match exactly")
+        st.markdown("- Prevents false positive matches")
+        st.markdown("- Manual verification recommended")
+
+    st.divider()
+
+    # Action items
+    st.subheader("📝 Recommended Actions")
+
+    action_col1, action_col2 = st.columns(2)
+
+    with action_col1:
+        st.markdown("**For No Match Items:**")
+        st.markdown("1. Check if products exist in NL catalog")
+        st.markdown("2. Verify brand names are consistent")
+        st.markdown("3. Look for naming differences (typos, formatting)")
+        st.markdown("4. Consider adding missing products to catalog")
+
+    with action_col2:
+        st.markdown("**For Review Required Items:**")
+        st.markdown("1. Manually verify each match")
+        st.markdown("2. Check if model/storage attributes are correct")
+        st.markdown("3. Override if match is acceptable")
+        st.markdown("4. Flag false positives for exclusion")
 
 # ---------------------------------------------------------------------------
 # Footer
