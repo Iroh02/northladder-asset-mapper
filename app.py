@@ -55,18 +55,14 @@ st.markdown("**Intelligent fuzzy matching with attribute verification and hybrid
 # Sidebar
 # ---------------------------------------------------------------------------
 st.sidebar.header("⚙️ Settings")
-threshold = st.sidebar.slider(
-    "Similarity Threshold (%)",
-    min_value=50, max_value=100, value=SIMILARITY_THRESHOLD, step=1,
-    help="Minimum fuzzy match score. Default 85%.",
-)
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("**Confidence Tiers:**")
-st.sidebar.markdown("🟢 **MATCHED** (HIGH) — Auto-apply, score >= 95%")
-st.sidebar.markdown("🟡 **REVIEW REQUIRED** (MEDIUM) — Do not auto-apply, needs human review")
-st.sidebar.markdown("🔴 **NO_MATCH** (LOW) — Manual mapping, score < 85%")
-st.sidebar.markdown("🔵 **MULTIPLE_MATCHES** — Multiple IDs for same name")
+# Fixed threshold at 85% - hybrid matching with auto-select handles everything
+threshold = SIMILARITY_THRESHOLD
+
+st.sidebar.markdown("**Match Status:**")
+st.sidebar.markdown("🟢 **MATCHED** — Confident match with single ID (auto-selected if needed)")
+st.sidebar.markdown("🟡 **REVIEW REQUIRED** — Needs manual review (score 85-94%, attributes differ)")
+st.sidebar.markdown("🔴 **NO_MATCH** — No confident match found (score < 85%)")
 
 # Admin: refresh NL reference (hidden in sidebar expander)
 with st.sidebar.expander("Admin: NL Reference"):
@@ -204,13 +200,12 @@ with tab1:
           ├─ Token Sort Fuzzy Match
           └─ Model Token Guardrail
        ↓
-    4. Attribute Verification (85-94% scores)
-       └─ Auto-upgrade if critical attributes match
+    4. Auto-Select for Multiple Variants
+       └─ Matches user's exact specs (year, 5G/4G)
        ↓
     5. Results Classification
-       ├─ ✅ MATCHED (≥90%, single ID)
-       ├─ 🔵 MULTIPLE_MATCHES (≥90%, multiple IDs)
-       ├─ 🟡 REVIEW (85-89%, verification failed)
+       ├─ ✅ MATCHED (≥90%, auto-selected if multiple IDs)
+       ├─ 🟡 REVIEW (85-94%, attributes differ)
        └─ 🔴 NO_MATCH (<85%)
     ```
     """)
@@ -508,8 +503,10 @@ if asset_upload is not None:
 with tab3:
     st.header("🎯 Interactive Variant Selector")
     st.markdown("""
-    When a product has **MULTIPLE_MATCHES** (multiple variant IDs), use this tool to select the correct one.
-    Upload your mapping results and interactively choose which variant ID to use for each product.
+    Review and override auto-selected variants. The system automatically selects the best variant based on
+    your product's specs (year, 5G/4G), but you can manually choose a different variant if needed.
+
+    Upload your latest mapping results from the **Mapping** tab to review auto-selections.
     """)
 
     # Upload results file
@@ -521,45 +518,46 @@ with tab3:
             df_l1_mapped = pd.read_excel(results_upload, sheet_name='List 1 - Mapped')
             df_l2_mapped = pd.read_excel(results_upload, sheet_name=' List 2 - Mapped')
 
-            # Find MULTIPLE_MATCHES
-            l1_multiple = df_l1_mapped[df_l1_mapped['match_status'] == MATCH_STATUS_MULTIPLE]
-            l2_multiple = df_l2_mapped[df_l2_mapped['match_status'] == MATCH_STATUS_MULTIPLE]
+            # Find auto-selected items (these have alternatives to choose from)
+            l1_autoselect = df_l1_mapped[df_l1_mapped['auto_selected'] == True]
+            l2_autoselect = df_l2_mapped[df_l2_mapped['auto_selected'] == True]
 
-            total_multiple = len(l1_multiple) + len(l2_multiple)
+            total_autoselect = len(l1_autoselect) + len(l2_autoselect)
 
-            if total_multiple == 0:
-                st.success("🎉 No MULTIPLE_MATCHES found! All items have unique IDs.")
+            if total_autoselect == 0:
+                st.info("ℹ️ No auto-selected variants found. All items have single unique IDs.")
                 st.stop()
 
             # Show stats
             col1, col2, col3 = st.columns(3)
             with col1:
-                st.metric("Total MULTIPLE_MATCHES", total_multiple)
+                st.metric("Auto-Selected Items", total_autoselect)
             with col2:
-                st.metric("List 1", len(l1_multiple))
+                st.metric("List 1", len(l1_autoselect))
             with col3:
-                st.metric("List 2", len(l2_multiple))
+                st.metric("List 2", len(l2_autoselect))
 
             st.divider()
 
             # Interactive selector
-            st.subheader("Select Correct Variants")
+            st.subheader("Review Auto-Selected Variants")
+            st.caption("✓ Auto-selection logic: Year → Connectivity (5G/4G) → First ID")
 
             # Initialize session state for selections
             if 'variant_selections' not in st.session_state:
                 st.session_state.variant_selections = {}
 
-            # Combine all multiple matches
-            all_multiple = []
-            for idx, row in l1_multiple.iterrows():
-                all_multiple.append(('List 1', idx, row))
-            for idx, row in l2_multiple.iterrows():
-                all_multiple.append(('List 2', idx, row))
+            # Combine all auto-selected items
+            all_autoselect = []
+            for idx, row in l1_autoselect.iterrows():
+                all_autoselect.append(('List 1', idx, row))
+            for idx, row in l2_autoselect.iterrows():
+                all_autoselect.append(('List 2', idx, row))
 
             # Show items with variant selection
-            st.markdown(f"**Showing {min(20, len(all_multiple))} of {len(all_multiple)} items** (first 20 for demo)")
+            st.markdown(f"**Showing {min(20, len(all_autoselect))} of {len(all_autoselect)} items** (first 20 for demo)")
 
-            for i, (sheet, idx, row) in enumerate(all_multiple[:20]):
+            for i, (sheet, idx, row) in enumerate(all_autoselect[:20]):
                 with st.expander(f"Item {i+1}: {row.get('name', row.get('Foxway Product Name', ''))}"):
                     # Show match info
                     col_info, col_select = st.columns([2, 1])
@@ -568,49 +566,76 @@ with tab3:
                         st.markdown(f"**Your Product:** {row.get('name', row.get('Foxway Product Name', ''))}")
                         st.markdown(f"**Matched To:** `{row['matched_on']}`")
                         st.markdown(f"**Match Score:** {row['match_score']:.1f}%")
+                        st.markdown(f"**Selection Reason:** {row.get('selection_reason', 'N/A')}")
 
-                    # Parse IDs
-                    ids = str(row['mapped_uae_assetid']).split(',')
-                    ids = [id.strip() for id in ids]
+                    # Parse alternatives (stored as list in Excel)
+                    current_id = str(row['mapped_uae_assetid']).strip()
+
+                    # Get alternatives from the alternatives column
+                    alternatives_raw = row.get('alternatives', '')
+                    if isinstance(alternatives_raw, str) and alternatives_raw:
+                        try:
+                            alternatives = eval(alternatives_raw) if alternatives_raw.startswith('[') else []
+                        except:
+                            alternatives = []
+                    else:
+                        alternatives = []
+
+                    # Build full list: current ID + alternatives
+                    all_ids = [current_id] + alternatives
 
                     # Show variant options
-                    st.markdown(f"**{len(ids)} Variant Options:**")
+                    st.markdown(f"**{len(all_ids)} Variant Options:**")
 
                     variant_options = []
-                    for id_val in ids:
+                    for id_val in all_ids:
                         nl_entry = df_nl_clean[df_nl_clean['uae_assetid'] == id_val]
                         if len(nl_entry) > 0:
                             product_name = nl_entry.iloc[0]['uae_assetname']
+                            prefix = "✓ **SELECTED:** " if id_val == current_id else "   "
                             variant_options.append(f"{id_val}: {product_name}")
-                            st.markdown(f"- `{id_val}`: {product_name}")
+                            st.markdown(f"{prefix}`{id_val}`: {product_name}")
 
                     # Selection dropdown
                     with col_select:
                         key = f"{sheet}_{idx}"
                         selected = st.selectbox(
-                            "Choose variant:",
-                            options=range(len(ids)),
+                            "Override selection:",
+                            options=range(len(all_ids)),
+                            index=0,  # Default to current selection
                             format_func=lambda x: f"Variant {x+1}",
                             key=f"select_{key}"
                         )
-                        st.session_state.variant_selections[key] = ids[selected]
-                        st.success(f"Selected ID: `{ids[selected]}`")
+                        st.session_state.variant_selections[key] = all_ids[selected]
+                        if all_ids[selected] != current_id:
+                            st.warning(f"Overridden to: `{all_ids[selected]}`")
+                        else:
+                            st.success(f"Using auto-selected: `{all_ids[selected]}`")
 
             st.divider()
 
             # Apply selections button
-            if st.button("✅ Apply Selections & Download", type="primary", use_container_width=True):
+            if st.button("✅ Apply Overrides & Download", type="primary", use_container_width=True):
+                # Count overrides
+                override_count = 0
+
                 # Apply selections to dataframes
                 for key, selected_id in st.session_state.variant_selections.items():
                     sheet, idx_str = key.split('_', 1)
                     idx = int(idx_str)
 
                     if sheet == 'List 1':
-                        df_l1_mapped.at[idx, 'mapped_uae_assetid'] = selected_id
-                        df_l1_mapped.at[idx, 'match_status'] = MATCH_STATUS_MATCHED
+                        original_id = df_l1_mapped.at[idx, 'mapped_uae_assetid']
+                        if str(selected_id) != str(original_id):
+                            df_l1_mapped.at[idx, 'mapped_uae_assetid'] = selected_id
+                            df_l1_mapped.at[idx, 'selection_reason'] = 'Manually overridden'
+                            override_count += 1
                     else:
-                        df_l2_mapped.at[idx, 'mapped_uae_assetid'] = selected_id
-                        df_l2_mapped.at[idx, 'match_status'] = MATCH_STATUS_MATCHED
+                        original_id = df_l2_mapped.at[idx, 'mapped_uae_assetid']
+                        if str(selected_id) != str(original_id):
+                            df_l2_mapped.at[idx, 'mapped_uae_assetid'] = selected_id
+                            df_l2_mapped.at[idx, 'selection_reason'] = 'Manually overridden'
+                            override_count += 1
 
                 # Generate output Excel
                 output = io.BytesIO()
@@ -628,7 +653,11 @@ with tab3:
                     type="primary",
                     use_container_width=True,
                 )
-                st.success(f"✅ Applied {len(st.session_state.variant_selections)} selections!")
+
+                if override_count > 0:
+                    st.success(f"✅ Applied {override_count} manual override(s)!")
+                else:
+                    st.info("ℹ️ No overrides made. All auto-selections kept.")
 
         except Exception as e:
             st.error(f"Error loading results: {e}")
