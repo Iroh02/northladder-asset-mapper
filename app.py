@@ -27,6 +27,8 @@ from matcher import (
     load_nl_reference,
     nl_reference_exists,
     delete_nl_reference,
+    compute_coverage_metrics,
+    detect_catalog_gaps,
     SIMILARITY_THRESHOLD,
     HIGH_CONFIDENCE_THRESHOLD,
     MATCH_STATUS_MATCHED,
@@ -150,13 +152,235 @@ st.success(
 )
 
 # =========================================================================
+# Dashboard helper functions
+# =========================================================================
+
+@st.cache_data(show_spinner="Loading diagnostic report...")
+def load_diagnostic_report(file) -> pd.DataFrame:
+    """Load the diagnostic report Excel and return the combined DataFrame."""
+    try:
+        df = pd.read_excel(file, sheet_name='All Combined')
+        return df
+    except Exception:
+        # Fallback: try first sheet
+        df = pd.read_excel(file, sheet_name=0)
+        return df
+
+
+def _safe_col(df, candidates):
+    """Return the first column name from candidates that exists in df, or None."""
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def render_dashboard(df: pd.DataFrame):
+    """Render the full mapping performance dashboard from a diagnostic DataFrame."""
+    total = len(df)
+    if total == 0:
+        st.warning("No data in diagnostic report.")
+        return
+
+    status_col = _safe_col(df, ['match_status'])
+    score_col = _safe_col(df, ['match_score'])
+    method_col = _safe_col(df, ['method'])
+    source_col = _safe_col(df, ['source_sheet', 'Source Sheet'])
+    name_col = _safe_col(df, ['name', 'Foxway Product Name', 'product_name'])
+    brand_col = _safe_col(df, ['Brand', 'brand', 'manufacturer'])
+    matched_on_col = _safe_col(df, ['matched_on'])
+    vpass_col = _safe_col(df, ['verification_pass'])
+    vreasons_col = _safe_col(df, ['verification_reasons'])
+    qcat_col = _safe_col(df, ['query_category'])
+    top1_name = _safe_col(df, ['top1_name', 'top1_candidate_name'])
+    top1_score = _safe_col(df, ['top1_score', 'top1_candidate_score'])
+
+    matched = df[df[status_col] == 'MATCHED'] if status_col else pd.DataFrame()
+    review = df[df[status_col] == 'REVIEW_REQUIRED'] if status_col else pd.DataFrame()
+    no_match = df[df[status_col] == 'NO_MATCH'] if status_col else pd.DataFrame()
+
+    # ---- SECTION 1: Top Summary Metrics ----
+    st.subheader("1. Summary Metrics")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Assets", f"{total:,}")
+    c2.metric("MATCHED", f"{len(matched):,}", f"{len(matched)/total*100:.1f}%")
+    c3.metric("REVIEW REQUIRED", f"{len(review):,}", f"{len(review)/total*100:.1f}%")
+    c4.metric("NO MATCH", f"{len(no_match):,}", f"{len(no_match)/total*100:.1f}%")
+
+    c5, c6, c7 = st.columns(3)
+    c5.metric("Match Rate", f"{len(matched)/total*100:.1f}%")
+    if method_col:
+        attr_count = df[method_col].str.contains('attribute', case=False, na=False).sum()
+        fuzzy_count = df[method_col].str.contains('fuzzy', case=False, na=False).sum()
+        c6.metric("Attribute Match Rate", f"{attr_count/total*100:.1f}%" if total else "0%")
+        c7.metric("Fuzzy Match Rate", f"{fuzzy_count/total*100:.1f}%" if total else "0%")
+
+    st.divider()
+
+    # ---- SECTION 2: Match Rate by Sheet ----
+    if source_col:
+        st.subheader("2. Match Rate by Sheet")
+        sheet_stats = []
+        for sheet, grp in df.groupby(source_col):
+            n = len(grp)
+            m = len(grp[grp[status_col] == 'MATCHED']) if status_col else 0
+            sheet_stats.append({'Sheet': sheet, 'Total': n, 'Matched': m, 'Match Rate (%)': round(m / n * 100, 1) if n else 0})
+        df_sheets = pd.DataFrame(sheet_stats)
+        st.bar_chart(df_sheets.set_index('Sheet')['Match Rate (%)'])
+        st.dataframe(df_sheets, use_container_width=True, hide_index=True)
+        st.divider()
+
+    # ---- SECTION 3: Match Status Breakdown ----
+    if status_col:
+        st.subheader("3. Match Status Breakdown")
+        status_counts = df[status_col].value_counts()
+        col_left, col_right = st.columns(2)
+        with col_left:
+            st.bar_chart(status_counts)
+        with col_right:
+            for status, count in status_counts.items():
+                pct = count / total * 100
+                emoji = {"MATCHED": "🟢", "REVIEW_REQUIRED": "🟡", "NO_MATCH": "🔴", "MULTIPLE_MATCHES": "🔵"}.get(status, "⚪")
+                st.markdown(f"{emoji} **{status}**: {count:,} ({pct:.1f}%)")
+        st.divider()
+
+    # ---- SECTION 4: Match Method Breakdown ----
+    if method_col:
+        st.subheader("4. Match Method Breakdown")
+        method_counts = df[method_col].value_counts()
+
+        # Group into attribute vs fuzzy vs none
+        attr_total = method_counts[method_counts.index.str.contains('attribute', case=False, na=False)].sum()
+        fuzzy_total = method_counts[method_counts.index.str.contains('fuzzy', case=False, na=False)].sum()
+        none_total = method_counts.get('none', 0)
+        other_total = total - attr_total - fuzzy_total - none_total
+
+        summary_methods = pd.Series({
+            'Attribute (fast path)': int(attr_total),
+            'Fuzzy (fallback)': int(fuzzy_total),
+            'No match': int(none_total),
+        })
+        col_left, col_right = st.columns(2)
+        with col_left:
+            st.bar_chart(summary_methods)
+        with col_right:
+            st.markdown("**Detailed methods:**")
+            for m, c in method_counts.head(10).items():
+                st.markdown(f"- `{m}`: {c:,} ({c/total*100:.1f}%)")
+
+        st.divider()
+
+    # ---- SECTION 5: Brand Coverage Analysis ----
+    if brand_col and status_col:
+        st.subheader("5. Brand Coverage Analysis")
+        brand_stats = []
+        for brand, grp in df.groupby(df[brand_col].astype(str).str.strip()):
+            if brand.lower() in ('nan', 'none', ''):
+                continue
+            n = len(grp)
+            m = len(grp[grp[status_col] == 'MATCHED'])
+            brand_stats.append({
+                'Brand': brand,
+                'Total': n,
+                'Matched': m,
+                'Match Rate (%)': round(m / n * 100, 1) if n else 0,
+            })
+        df_brands = pd.DataFrame(brand_stats).sort_values('Match Rate (%)')
+
+        col_left, col_right = st.columns(2)
+        with col_left:
+            st.markdown("**Lowest 15 brands by match rate:**")
+            bottom15 = df_brands.head(15).set_index('Brand')
+            st.bar_chart(bottom15['Match Rate (%)'])
+        with col_right:
+            st.dataframe(df_brands, use_container_width=True, hide_index=True, height=400)
+
+        st.divider()
+
+    # ---- SECTION 6: Near-Miss Analysis ----
+    st.subheader("6. Near-Miss Analysis")
+    if status_col and top1_score:
+        near_miss = df[
+            (df[status_col] == 'NO_MATCH') &
+            (pd.to_numeric(df[top1_score], errors='coerce') >= 80)
+        ]
+        st.metric("Near-Miss Items (score 80-84)", len(near_miss))
+        if len(near_miss) > 0:
+            display_cols = [c for c in [name_col, brand_col, top1_name, top1_score] if c]
+            st.dataframe(
+                near_miss[display_cols].sort_values(top1_score, ascending=False).head(50),
+                use_container_width=True, hide_index=True,
+            )
+        else:
+            st.info("No near-miss items found.")
+    elif status_col and score_col:
+        near_miss = df[
+            (df[status_col] == 'NO_MATCH') &
+            (pd.to_numeric(df[score_col], errors='coerce') >= 80)
+        ]
+        st.metric("Near-Miss Items (score >= 80)", len(near_miss))
+        if len(near_miss) > 0:
+            display_cols = [c for c in [name_col, brand_col, matched_on_col, score_col] if c]
+            st.dataframe(
+                near_miss[display_cols].sort_values(score_col, ascending=False).head(50),
+                use_container_width=True, hide_index=True,
+            )
+    st.divider()
+
+    # ---- SECTION 7: Risk Monitoring ----
+    st.subheader("7. Risk Monitoring — Potential False Positives")
+    if vpass_col and status_col:
+        # Items that are MATCHED but verification gate failed
+        risk_items = df[
+            (df[status_col] == 'MATCHED') &
+            (df[vpass_col] == False)
+        ]
+        st.metric("False Positive Risk Items", len(risk_items))
+        if len(risk_items) > 0:
+            st.warning(f"Found {len(risk_items)} MATCHED items where verification gate failed. Audit recommended.")
+            display_cols = [c for c in [name_col, matched_on_col, score_col, vreasons_col] if c]
+            st.dataframe(risk_items[display_cols].head(50), use_container_width=True, hide_index=True)
+        else:
+            st.success("No false positive risks detected. All MATCHED items pass verification gate.")
+    else:
+        st.info("Verification gate columns not found in report. Run matching with `diagnostic=True` to enable.")
+    st.divider()
+
+    # ---- SECTION 8: Category Coverage ----
+    if qcat_col and status_col:
+        st.subheader("8. Category Coverage")
+        cat_stats = []
+        for cat, grp in df.groupby(df[qcat_col].astype(str).str.strip()):
+            if cat.lower() in ('nan', 'none', ''):
+                continue
+            n = len(grp)
+            m = len(grp[grp[status_col] == 'MATCHED'])
+            cat_stats.append({
+                'Category': cat,
+                'Total': n,
+                'Matched': m,
+                'Match Rate (%)': round(m / n * 100, 1) if n else 0,
+            })
+        df_cats = pd.DataFrame(cat_stats).sort_values('Match Rate (%)', ascending=False)
+
+        col_left, col_right = st.columns(2)
+        with col_left:
+            st.bar_chart(df_cats.set_index('Category')['Match Rate (%)'])
+        with col_right:
+            st.dataframe(df_cats, use_container_width=True, hide_index=True)
+    elif brand_col and status_col:
+        st.subheader("8. Category Coverage")
+        st.info("Category column not found in report. Run matching with `diagnostic=True` for category breakdown.")
+
+
+# =========================================================================
 # Tab Navigation
 # =========================================================================
 # Conditionally show Variant Selector tab based on advanced mode toggle
 if show_advanced:
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard", "🔗 Mapping", "🎯 Variant Selector", "❌ Unmatched Analysis"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Dashboard", "🔗 Mapping", "🎯 Variant Selector", "❌ Unmatched Analysis", "📊 Mapping Performance"])
 else:
-    tab1, tab2, tab4 = st.tabs(["📊 Dashboard", "🔗 Mapping", "❌ Unmatched Analysis"])
+    tab1, tab2, tab4, tab5 = st.tabs(["📊 Dashboard", "🔗 Mapping", "❌ Unmatched Analysis", "📊 Mapping Performance"])
     tab3 = None  # Variant Selector is hidden
 
 # =========================================================================
@@ -1162,6 +1386,36 @@ with tab4:
         st.markdown("2. Check if model/storage attributes are correct")
         st.markdown("3. Override if match is acceptable")
         st.markdown("4. Flag false positives for exclusion")
+
+# =========================================================================
+# TAB 5: MAPPING PERFORMANCE DASHBOARD
+# =========================================================================
+with tab5:
+    st.header("📊 Mapping Performance Dashboard")
+    st.markdown("Upload a diagnostic report Excel file to visualize mapping performance, coverage, and risks.")
+
+    diag_upload = st.file_uploader(
+        "📁 Upload Diagnostic Report (.xlsx)",
+        type=["xlsx"],
+        key="diag_upload",
+        help="Upload match_diagnostic_report_batch3.xlsx or any diagnostic report generated by the matching engine.",
+    )
+
+    if diag_upload is not None:
+        df_diag = load_diagnostic_report(diag_upload)
+        if df_diag is not None and len(df_diag) > 0:
+            st.success(f"Loaded {len(df_diag):,} rows from diagnostic report. Columns: {len(df_diag.columns)}")
+            render_dashboard(df_diag)
+        else:
+            st.error("Failed to load diagnostic report or file is empty.")
+    else:
+        st.info("Upload a diagnostic report to view the performance dashboard.")
+        st.markdown("""
+        **How to generate a diagnostic report:**
+        1. Run the mapping in the **Mapping** tab
+        2. Or use `run_matching(..., diagnostic=True)` in Python
+        3. The report should contain columns like `match_status`, `match_score`, `method`, etc.
+        """)
 
 # ---------------------------------------------------------------------------
 # Footer
