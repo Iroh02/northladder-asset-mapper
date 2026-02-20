@@ -788,14 +788,16 @@ with tab2:
                         insert_pos = list(matched.columns).index('mapped_uae_assetid') + 1
                         matched.insert(insert_pos, 'nl_product_name', nl_product_names)
 
-                        safe_name = f"{sheet_name} - Matched"[:31]
+                        suffix = ' - Matched'
+                        safe_name = sheet_name[:31 - len(suffix)] + suffix
                         matched.to_excel(writer, sheet_name=safe_name, index=False)
 
                 # 2. UNMATCHED sheets (one per uploaded sheet) - Only NO_MATCH items
                 for sheet_name, df_result in all_results.items():
                     unmatched = df_result[df_result['match_status'] == MATCH_STATUS_NO_MATCH]
                     if len(unmatched) > 0:
-                        safe_name = f"{sheet_name} - Unmatched"[:31]
+                        suffix = ' - Unmatched'
+                        safe_name = sheet_name[:31 - len(suffix)] + suffix
                         unmatched.to_excel(writer, sheet_name=safe_name, index=False)
 
                 # 3. REVIEW REQUIRED sheet - All REVIEW_REQUIRED items (combined)
@@ -1181,14 +1183,16 @@ if tab3 is not None:
                         for sheet_name, df_result in all_dataframes.items():
                             matched = df_result[df_result['match_status'] == MATCH_STATUS_MATCHED]
                             if len(matched) > 0:
-                                safe_name = f"{sheet_name} - Matched"[:31]
+                                suffix = ' - Matched'
+                                safe_name = sheet_name[:31 - len(suffix)] + suffix
                                 matched.to_excel(writer, sheet_name=safe_name, index=False)
 
                         # 2. UNMATCHED sheets
                         for sheet_name, df_result in all_dataframes.items():
                             unmatched = df_result[df_result['match_status'] == MATCH_STATUS_NO_MATCH]
                             if len(unmatched) > 0:
-                                safe_name = f"{sheet_name} - Unmatched"[:31]
+                                suffix = ' - Unmatched'
+                                safe_name = sheet_name[:31 - len(suffix)] + suffix
                                 unmatched.to_excel(writer, sheet_name=safe_name, index=False)
 
                         # 3. REVIEW REQUIRED sheet (curated columns to avoid NaN across sheets)

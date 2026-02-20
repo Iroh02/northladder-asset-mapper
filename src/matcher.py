@@ -25,6 +25,7 @@ import os
 import json
 import re
 from functools import lru_cache
+from urllib.parse import urlparse, unquote
 import pandas as pd
 from rapidfuzz import fuzz, process
 from typing import Dict, List, Callable, Optional, Tuple
@@ -45,7 +46,8 @@ CONFIDENCE_MEDIUM = "MEDIUM"  # 85-94%
 CONFIDENCE_LOW = "LOW"        # < 85%
 
 # Variant tokens that must match exactly between query and candidate
-VARIANT_TOKENS = {"pro", "max", "ultra", "plus", "fold", "flip", "fe", "mini", "lite", "note", "edge"}
+VARIANT_TOKENS = {"pro", "max", "ultra", "plus", "fold", "flip", "fe", "mini", "lite", "note", "edge",
+                  "gt", "turbo", "neo", "speed", "kit"}
 
 # Hardware model code pattern (e.g., ZE552KL, SM-G960F, A2172)
 # Requires 3+ digits to avoid matching normal model numbers like "s23", "a52"
@@ -162,6 +164,35 @@ for alias, canonical in BRAND_ALIASES.items():
     if first not in _BRAND_FROM_FIRST_WORD:
         _BRAND_FROM_FIRST_WORD[first] = canonical
 
+# Product-line names that unambiguously identify a brand.
+# Enables brand inference when input has no Brand column (e.g., "iPhone 15 128GB Bleu").
+_PRODUCT_LINE_TO_BRAND = {
+    # Apple
+    'iphone': 'apple', 'ipad': 'apple', 'macbook': 'apple', 'airpods': 'apple',
+    'imac': 'apple',
+    # Samsung
+    'galaxy': 'samsung',
+    # Google
+    'pixel': 'google',
+    # Xiaomi
+    'redmi': 'xiaomi', 'poco': 'poco',
+    # Huawei
+    'matepad': 'huawei', 'matebook': 'huawei',
+    # OnePlus
+    'nord': 'oneplus',
+    # OPPO
+    'reno': 'oppo', 'realme': 'realme',
+    # Motorola
+    'moto': 'motorola', 'razr': 'motorola',
+    # Microsoft
+    'surface': 'microsoft',
+    # Lenovo
+    'thinkpad': 'lenovo', 'ideapad': 'lenovo', 'yoga': 'lenovo',
+    # Dell
+    'latitude': 'dell', 'inspiron': 'dell', 'xps': 'dell',
+}
+_BRAND_FROM_FIRST_WORD.update(_PRODUCT_LINE_TO_BRAND)
+
 
 def _infer_brand_from_name(product_name: str) -> str:
     """
@@ -188,7 +219,98 @@ def _infer_brand_from_name(product_name: str) -> str:
         two_words = f"{words[0]} {words[1]}"
         if two_words in _BRAND_FROM_FIRST_WORD:
             return _BRAND_FROM_FIRST_WORD[two_words]
+    # Try stripping trailing digits from first word for product-line matching
+    # Handles "reno4" → "reno" → oppo, "galaxy" stays "galaxy" (no digits)
+    first_base = re.sub(r'\d+$', '', first)
+    if first_base and first_base != first and first_base in _PRODUCT_LINE_TO_BRAND:
+        return _PRODUCT_LINE_TO_BRAND[first_base]
     return ''
+
+
+# ---------------------------------------------------------------------------
+# URL → product name extraction
+# ---------------------------------------------------------------------------
+
+def _is_url(text: str) -> bool:
+    """Check if text looks like a URL."""
+    if not isinstance(text, str):
+        return False
+    t = text.strip().lower()
+    return t.startswith(('http://', 'https://', 'www.'))
+
+
+def extract_name_from_url(url: str) -> str:
+    """
+    Extract a human-readable product name from a product page URL.
+
+    Handles common e-commerce URL patterns:
+        https://www.recommerce.com/fr/iphone-15-128go-bleu → 'iphone 15 128go bleu'
+        https://example.com/products/samsung-galaxy-s23-256gb → 'samsung galaxy s23 256gb'
+
+    Returns empty string if parsing fails or no meaningful name found.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return ''
+    try:
+        parsed = urlparse(url.strip())
+        # Use the last meaningful path segment
+        path = unquote(parsed.path).strip('/')
+        if not path:
+            return ''
+        # Take last segment (most specific), e.g., "iphone-15-128go-bleu"
+        slug = path.split('/')[-1]
+        # Remove common file extensions
+        slug = re.sub(r'\.(html?|php|aspx?|jsp)$', '', slug, flags=re.IGNORECASE)
+        # Remove query-like suffixes that leaked into the slug
+        slug = re.sub(r'[?#].*', '', slug)
+        # Replace hyphens/underscores with spaces
+        name = slug.replace('-', ' ').replace('_', ' ')
+        # Remove pure-numeric segments and UUIDs
+        name = re.sub(r'\b[0-9a-f]{8,}\b', '', name)
+        # Collapse whitespace
+        name = re.sub(r'\s+', ' ', name).strip()
+        # Reject if too short (likely not a product name)
+        if len(name) < 4:
+            return ''
+        return name
+    except Exception:
+        return ''
+
+
+# ---------------------------------------------------------------------------
+# Color word stripping (pre-normalization)
+# ---------------------------------------------------------------------------
+
+# Color words that appear in recommerce/reseller data but are NEVER part of
+# NL catalog product names. Stripping them improves fuzzy matching.
+_COLOR_WORDS = {
+    # French
+    'bleu', 'noir', 'vert', 'rose', 'jaune', 'rouge', 'blanc', 'gris',
+    'argent', 'or', 'violet', 'orange', 'corail', 'sideral', 'ciel',
+    'sable', 'lumiere', 'minuit', 'creme',
+    # English
+    'black', 'white', 'blue', 'green', 'red', 'gold', 'silver', 'purple',
+    'pink', 'yellow', 'orange', 'coral', 'graphite', 'midnight', 'starlight',
+    'cream', 'titanium', 'space', 'grey', 'gray', 'sierra',
+}
+
+def strip_color_words(text: str) -> str:
+    """
+    Remove color words from a product name string.
+
+    Only strips words that are standalone tokens (word boundaries) and are
+    known color names. Does NOT strip substrings within product names.
+
+    Examples:
+        'iPhone 15 128gb Bleu' → 'iPhone 15 128gb'
+        'iPhone Xs 64gb Gris Sideral' → 'iPhone Xs 64gb'
+        'iPhone 15 Pro 256gb' → 'iPhone 15 Pro 256gb' (unchanged)
+    """
+    if not isinstance(text, str):
+        return text
+    words = text.split()
+    filtered = [w for w in words if w.lower() not in _COLOR_WORDS]
+    return ' '.join(filtered).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +383,7 @@ def normalize_text(text: str) -> str:
     # Pattern: tab + model letter → add space (tabs8 → tab s8, taba7 → tab a7)
     s = re.sub(r'\b(tab)([a-z]\d)', r'\1 \2', s)
     # Pattern: known brand names directly followed by digits → add space
-    s = re.sub(r'\b(iphone|ipad|galaxy|pixel|redmi|mate|nova|honor|poco|note)(\d)', r'\1 \2', s)
+    s = re.sub(r'\b(iphone|ipad|galaxy|pixel|redmi|mate|nova|honor|poco|note|reno|find)(\d)', r'\1 \2', s)
     # Pattern: digits directly followed by known variant keywords → add space
     s = re.sub(r'(\d)(pro|max|plus|ultra|lite|mini|se)\b', r'\1 \2', s)
 
@@ -290,6 +412,11 @@ def normalize_text(text: str) -> str:
     # Remove common punctuation — replace with space to preserve token boundaries
     # This converts "(2016)" to " 2016 " which keeps the year
     s = re.sub(r'[,\-\(\)"\'\/\.]', ' ', s)
+
+    # French storage units: "Go" (Giga-octets) → GB, "To" (Téra-octets) → TB
+    # "256 Go" → "256gb", "1 To" → "1tb" (common in French recommerce data)
+    s = re.sub(r'(\d+)\s*go\b', r'\1gb', s, flags=re.IGNORECASE)
+    s = re.sub(r'(\d+)\s*to\b', r'\1tb', s, flags=re.IGNORECASE)
 
     # Fix missing unit: "256g" → "256gb" (common typo in some datasets)
     # Only convert true storage sizes (64g, 128g, 256g, 512g, 1024g, 2048g)
@@ -369,7 +496,7 @@ def extract_cpu_generation(text: str) -> str:
     if apple_match:
         return f"m{apple_match.group(1)}"
 
-    # Intel Core patterns: i3-12500H, i5-1165G7, i7-10750H
+    # 5Intel Core patterns: i3-1200H, i5-1165G7, i7-10750H
     # Also handles normalized text where dash is stripped: "i5 1245u"
     # Extract full model number, then determine gen from digit count + value
     intel_match = re.search(r'(?:core\s+)?i[3579][\s\-]?(\d{4,5})[a-z]{0,2}', text_lower)
@@ -1066,11 +1193,31 @@ def extract_product_attributes(text: str, brand: str = '') -> Dict[str, str]:
             attrs['model'] = match.group(1).strip()
             return _finalize_mobile_attrs(attrs)
 
+    # OPPO Reno: "reno 4 128gb", "reno 3 pro 256gb"
+    # NL catalog format: "oppo reno 3 series reno 3 pro 256gb" — strip redundant series label
+    if 'reno' in text_norm:
+        _reno_text = re.sub(r'reno\s+\d+\s+series\s+', '', text_norm)
+        match = re.search(r'reno\s+(\d+[a-z]*(?:\s+(?:pro|plus|ultra|lite|max|neo|z|f))*)', _reno_text)
+        if match:
+            attrs['product_line'] = 'reno'
+            attrs['model'] = match.group(1).strip()
+            return _finalize_mobile_attrs(attrs)
+
+    # OPPO Find: "find x5 pro 256gb"
+    # NL catalog format: "oppo find x5 series find x5 pro 256gb"
+    if 'find' in text_norm and ('oppo' in text_norm or 'oppo' in brand_norm):
+        _find_text = re.sub(r'find\s+[a-z]?\d+\s+series\s+', '', text_norm)
+        match = re.search(r'find\s+([a-z]?\d+[a-z]*(?:\s+(?:pro|plus|ultra|lite|max|neo))*)', _find_text)
+        if match:
+            attrs['product_line'] = 'find'
+            attrs['model'] = match.group(1).strip()
+            return _finalize_mobile_attrs(attrs)
+
     # === GENERIC EXTRACTION (all other brands) ===
-    # Detect common product line patterns: "find x5", "moto g50", "reno 8", etc.
+    # Detect common product line patterns: "moto g50", etc.
     # CRITICAL: Capture ALL variant words (pro max, plus, etc.)
 
-    # Pattern 1: "ProductLine ModelNumber" (e.g., "find x5", "reno 8 pro")
+    # Pattern 1: "ProductLine ModelNumber" (e.g., "moto g50")
     match = re.search(r'\b([a-z]+)\s+([a-z]?\d+[a-z]*(?:\s+(?:pro|plus|ultra|lite|max|mini|note|xl|edge|active))*)', text_norm, re.IGNORECASE)
     if match:
         line_candidate = match.group(1)
@@ -2111,6 +2258,10 @@ def extract_model_tokens(text: str) -> List[str]:
         'tab', 'watch', 'fold', 'flip', 'note', 'pad', 'book',
         # Generation markers that matter
         'edge', 'active', 'prime',
+        # Xiaomi/Poco/Redmi performance variants (GT ≠ base, Turbo ≠ base)
+        'gt', 'turbo', 'neo', 'speed',
+        # Bundle/kit suffix (Xiaomi 14 Ultra ≠ Xiaomi 14 Ultra Photography Kit)
+        'kit',
     }
 
     tokens = text_clean.split()
@@ -2124,7 +2275,122 @@ def extract_model_tokens(text: str) -> List[str]:
         elif token in variant_keywords:
             model_tokens.append(token)
 
+    # --- OPPO Reno Z/F variant extraction (brand-conditional) ---
+    # "Reno2 Z" and "Reno2" are DIFFERENT products in OPPO's lineup.
+    # Single-letter variants Z and F are only meaningful after a Reno family token.
+    # We do NOT globally treat "z" as important (would break Samsung Galaxy Z Fold etc.).
+    text_lower = text_clean.lower()
+    if 'reno' in text_lower:
+        # Match patterns like "reno 2 z", "reno 4 f", "reno z", "reno f"
+        # After de-concat: "reno2" → "reno 2", so digit may be a separate token
+        reno_variant_match = re.search(r'\breno\s*\d*\s+(z|f)\b', text_lower)
+        if reno_variant_match:
+            variant_letter = reno_variant_match.group(1)
+            if variant_letter not in model_tokens:
+                model_tokens.append(variant_letter)
+
     return model_tokens
+
+
+# ---------------------------------------------------------------------------
+# Brand-specific model identity extraction & guardrail
+# ---------------------------------------------------------------------------
+# Targeted at OPPO/Xiaomi/Redmi/Poco where cross-generation mismatches are
+# the most common failure mode. Does NOT fire for Samsung/Apple/Huawei.
+
+_MODEL_IDENTITY_BRANDS = {'oppo', 'xiaomi', 'redmi', 'poco', 'realme'}
+
+# Regex patterns that capture the full model identity token for each family.
+# Group structure: (family+generation, variant_suffix)
+_MODEL_IDENTITY_PATTERNS = [
+    # OPPO Reno: reno, reno2, reno4 pro, reno10 pro+, reno z
+    re.compile(r'\breno\s*(\d+)?\s*(pro\s*\+?|lite|z|f|neo|zoom)?\b', re.IGNORECASE),
+    # Redmi Note: note 12, note 12 pro, note 12 turbo
+    re.compile(r'\bnote\s*(\d+)\s*(pro|turbo|speed|play|prime)?\b', re.IGNORECASE),
+    # Poco F/X/M/C series: poco f4, poco f4 gt, poco x5 pro, poco m5
+    re.compile(r'\bpoco\s*([fxmc]\d+)\s*(pro|gt|neo)?\b', re.IGNORECASE),
+    # Xiaomi numbered series: xiaomi 14, xiaomi 14 ultra, xiaomi 13t pro
+    re.compile(r'\bxiaomi\s*(\d+)\s*(t)?\s*(ultra|pro|lite)?\b', re.IGNORECASE),
+    # Redmi numbered: redmi 12, redmi 12c, redmi k60 pro
+    re.compile(r'\bredmi\s*(\w?\d+\w?)\s*(pro|turbo|speed|play|prime)?\b', re.IGNORECASE),
+]
+
+
+def extract_model_identity(text: str) -> str:
+    """
+    Extract a normalized model identity string for OPPO/Xiaomi/Redmi/Poco devices.
+
+    Returns a compact identity string like:
+        'reno4pro', 'reno6', 'note12turbo', 'pocof4gt', '14ultra'
+
+    Returns '' if no recognizable model identity is found, or if the text
+    doesn't belong to a targeted brand.
+
+    Only fires for brands in _MODEL_IDENTITY_BRANDS.
+
+    Examples:
+        'Oppo Reno4 Pro 128GB'            → 'reno4pro'
+        'Oppo Reno6 Dual 128GB'           → 'reno6'
+        'Reno10 Pro 5G'                    → 'reno10pro'
+        'Redmi Note 12 Turbo 256GB'       → 'note12turbo'
+        'Poco F4 GT 128GB'                → 'pocof4gt'
+        'Xiaomi 14 Ultra'                 → 'xiaomi14ultra'
+        'Xiaomi 14 Ultra Photography Kit' → 'xiaomi14ultra'  (kit is NOT identity)
+        'Apple iPhone 15 Pro'             → ''  (not a targeted brand)
+    """
+    if not isinstance(text, str) or not text.strip():
+        return ''
+    t = text.lower().strip()
+
+    # Check if this belongs to a targeted brand
+    brand_found = any(b in t for b in _MODEL_IDENTITY_BRANDS)
+    if not brand_found:
+        # Also check product-line keywords that imply brand (reno → oppo, etc.)
+        if not any(kw in t for kw in ('reno', 'note', 'poco', 'redmi')):
+            return ''
+
+    best_identity = ''
+    for pattern in _MODEL_IDENTITY_PATTERNS:
+        # Find ALL matches (NL names repeat: "Reno Series, Reno Z" has 2 reno matches)
+        # Keep the most specific (longest) identity
+        for m in pattern.finditer(t):
+            groups = [g for g in m.groups() if g]
+            suffix = ''.join(g.strip().replace(' ', '').replace('+', 'plus')
+                             for g in groups)
+            # Extract the family keyword from the start of the match
+            match_text = m.group(0).lower().strip()
+            family_m = re.match(r'[a-z]+', match_text)
+            family = family_m.group(0) if family_m else ''
+            identity = (family + suffix).lower()
+            # Keep the most specific match (longest identity string)
+            if len(identity) > len(best_identity):
+                best_identity = identity
+    return best_identity
+
+
+def model_identity_guardrail(query: str, candidate: str) -> Tuple[bool, str]:
+    """
+    Brand-specific model identity guardrail for OPPO/Xiaomi/Redmi/Poco.
+
+    Compares the normalized model identity of query vs candidate.
+    If both have identities and they differ, the match is REJECTED.
+
+    Returns:
+        (pass_guardrail: bool, reason: str)
+
+    Only fires for targeted brands. Returns (True, '') for Samsung, Apple, etc.
+    """
+    q_id = extract_model_identity(query)
+    c_id = extract_model_identity(candidate)
+
+    if q_id and c_id:
+        if q_id != c_id:
+            return False, f'model_identity_mismatch:{q_id}!={c_id}'
+    elif q_id and not c_id:
+        # Query has identity but candidate doesn't — suspicious
+        return False, f'model_identity_missing_in_candidate:{q_id}'
+
+    return True, ''
 
 
 def extract_model_variant_keywords(text: str) -> Dict[str, any]:
@@ -2587,11 +2853,11 @@ def _verify_critical_attributes_inner(query: str, matched: str) -> bool:
             return False  # Primary model differs
 
     elif query_model and not matched_model:
-        # Query has model token but match doesn't
-        # This might be OK if it's just a generic base model
-        # e.g., "ROG Phone 6" -> "ROG Phone" (generic)
-        # Let's be conservative and allow this
-        pass
+        # Query has model token (e.g., "reno2") but match doesn't (e.g., "reno z")
+        # This means the match is a DIFFERENT generation/model entirely.
+        # e.g., "Reno2 Z 128GB" -> "Reno Z 128GB" (missing the "2" = wrong product)
+        # Conservative: reject the match. Prefer REVIEW_REQUIRED over false acceptance.
+        return False
 
     elif not query_model and matched_model:
         # Match has model token but query doesn't
@@ -3142,7 +3408,20 @@ def _enforce_gate(result: dict, query: str) -> dict:
         result['verification_reasons'] = ''
         return result
 
-    # Gate failed: downgrade to REVIEW_REQUIRED
+    # Gate failed: determine severity of downgrade
+    # Model identity mismatch on attribute match = wrong product entirely → NO_MATCH
+    # (e.g., Reno4 matched to Reno2 via attribute index — product doesn't exist in catalog)
+    _has_identity_mismatch = any(r.startswith('model_identity_mismatch:') for r in gate_reasons)
+    _is_attribute_method = method.startswith('attribute')
+    if _has_identity_mismatch and _is_attribute_method:
+        result['match_status'] = MATCH_STATUS_NO_MATCH
+        result['confidence'] = CONFIDENCE_LOW
+        result['verification_pass'] = False
+        result['verification_reasons'] = '; '.join(gate_reasons)
+        result['method'] = method + '_identity_rejected'
+        return result
+
+    # Standard gate failure: downgrade to REVIEW_REQUIRED
     result['match_status'] = MATCH_STATUS_SUGGESTED
     result['confidence'] = CONFIDENCE_MEDIUM
     result['verification_pass'] = False
@@ -3181,6 +3460,9 @@ def verification_gate(query_norm: str, cand_norm: str) -> Tuple[bool, List[str]]
         (pass_gate: bool, reasons: list[str])
         If pass_gate is False, the match must NOT be returned as MATCHED.
     """
+    # Re-normalize candidate to apply latest normalization rules (e.g., "reno7" → "reno 7")
+    # NL catalog's stored normalized_name may use older normalization without de-concat splits
+    cand_norm = normalize_text(cand_norm)
     reasons = []
 
     # 1. Category cross-match
@@ -3226,6 +3508,15 @@ def verification_gate(query_norm: str, cand_norm: str) -> Tuple[bool, List[str]]
                     if qt != mt:
                         reasons.append(f'model_token_mismatch:{qt}→{mt}')
                         break
+    elif q_tokens and not m_tokens:
+        # Query has model tokens (e.g., "reno2") but candidate has NONE (e.g., "reno z")
+        # This means the candidate is a different generation — reject.
+        # Prevents: "Reno2 Z 128GB" matching "Reno Z 128GB" (wrong product)
+        _year_re = re.compile(r'^20[012]\d$')
+        q_non_year = [t for t in q_tokens if not _year_re.match(t)]
+        q_non_year = [t for t in q_non_year if not MODEL_CODE_PATTERN.fullmatch(t)]
+        if q_non_year:
+            reasons.append(f'model_token_missing_in_candidate:{q_non_year}')
 
     # 5. Material mismatch (watches: aluminium vs steel vs titanium)
     _MATERIAL_GROUPS = {
@@ -3339,6 +3630,12 @@ def verification_gate(query_norm: str, cand_norm: str) -> Tuple[bool, List[str]]
         # Only enforce for categories where year distinguishes product generations
         if q_cat in ('tablet', 'laptop') or m_cat in ('tablet', 'laptop'):
             reasons.append(f'year_mismatch:{q_year_m.group(1)}→{m_year_m.group(1)}')
+
+    # 11. Brand-specific model identity guardrail (OPPO/Xiaomi/Redmi/Poco)
+    # Catches cross-generation mismatches like Reno4→Reno3, Note 12 Turbo→Note 12
+    id_pass, id_reason = model_identity_guardrail(query_norm, cand_norm)
+    if not id_pass:
+        reasons.append(id_reason)
 
     passed = len(reasons) == 0
     return passed, reasons
@@ -3762,9 +4059,11 @@ def _match_single_item_inner(
                     score = min(score, threshold - 1)  # Demote to NO_MATCH
                     break
     elif q_tokens and not m_tokens:
-        # Query has model token but match doesn't (e.g., "ROG Phone 6" → "ROG Phone")
-        # Demote to review — the match is likely a different generation
-        score = min(score, HIGH_CONFIDENCE_THRESHOLD - 1)  # Demote to REVIEW at most
+        # Query has model token but match doesn't (e.g., "Reno2 Z" vs "Reno Z")
+        # This is a DIFFERENT product — demote to NO_MATCH, not just REVIEW.
+        # Previously this only demoted to 89 (REVIEW), where the soft-upgrade path
+        # could still accept it because verification_gate skipped the empty-tokens case.
+        score = min(score, threshold - 1)  # Demote to NO_MATCH
     elif not q_tokens and m_tokens:
         # Match has model token but query doesn't (e.g., "Find X" → "Find X9")
         # Demote to review — the match added a model number the query doesn't have
@@ -4008,11 +4307,60 @@ def run_matching(
     category_col = _detect_category_column(df.columns.tolist())
     storage_col = _detect_storage_column(df.columns.tolist())
 
+    # Pre-detect fallback columns for URL/name recovery (once, not per-row)
+    _FALLBACK_NAME_COLS = ['product_name', 'product name', 'title', 'name',
+                           'asset name', 'asset_name', 'model_name', 'model name']
+    _FALLBACK_URL_COLS = ['url', 'product_url', 'link', 'href', 'product_slug']
+    col_lower_map = {str(c).strip().lower(): str(c).strip() for c in df.columns}
+    fallback_name_col = None
+    for fc in _FALLBACK_NAME_COLS:
+        if fc in col_lower_map and col_lower_map[fc] != name_col:
+            fallback_name_col = col_lower_map[fc]
+            break
+    fallback_url_col = None
+    for fc in _FALLBACK_URL_COLS:
+        if fc in col_lower_map and col_lower_map[fc] != name_col:
+            fallback_url_col = col_lower_map[fc]
+            break
+
     results = []
     for idx, row in df.iterrows():
+        no_match_reason = ''
+        query = ''
         try:
             input_brand = str(row.get(brand_col, '')).strip() if brand_col != '__no_brand__' else ''
             original_product_name = str(row.get(name_col, '')).strip()
+
+            # --- URL / empty name fallback ---
+            # If the detected name column contains a URL or is empty/nan, try fallbacks
+            _name_is_bad = (
+                not original_product_name
+                or original_product_name.lower() in ('nan', 'none', '')
+                or _is_url(original_product_name)
+            )
+            if _name_is_bad:
+                recovered = False
+                # Fallback 1: Try a dedicated name column we didn't pick initially
+                if fallback_name_col:
+                    fb_val = str(row.get(fallback_name_col, '')).strip()
+                    if fb_val and fb_val.lower() not in ('nan', 'none', '') and not _is_url(fb_val):
+                        original_product_name = fb_val
+                        recovered = True
+                # Fallback 2: Extract product name from a URL column
+                if not recovered and fallback_url_col:
+                    url_val = str(row.get(fallback_url_col, '')).strip()
+                    extracted = extract_name_from_url(url_val)
+                    if extracted:
+                        original_product_name = extracted
+                        recovered = True
+                # Fallback 3: Try extracting from the original value if it was a URL
+                if not recovered and _is_url(str(row.get(name_col, '')).strip()):
+                    extracted = extract_name_from_url(str(row.get(name_col, '')).strip())
+                    if extracted:
+                        original_product_name = extracted
+                        recovered = True
+                if not recovered:
+                    no_match_reason = 'EMPTY_PRODUCT_NAME' if not _is_url(str(row.get(name_col, '')).strip()) else 'URL_NOT_PARSED'
 
             # Brand inference: if brand is missing, try to extract from product name
             if not input_brand or input_brand.lower() in ('nan', 'none', ''):
@@ -4023,6 +4371,18 @@ def run_matching(
             # Extract category from uploaded data if available
             input_category = str(row.get(category_col, '')).strip() if category_col else ''
 
+            # --- Category inference fallback ---
+            # If no category column or value is empty, infer from product name
+            if not input_category or input_category.lower() in ('nan', 'none', ''):
+                inferred_cat = extract_category(original_product_name)
+                if inferred_cat and inferred_cat != 'other':
+                    input_category = inferred_cat
+
+            # Strip color words (French/English) before matching.
+            # Colors like "Bleu", "Noir", "Argent" in recommerce data are never
+            # in NL catalog names and dilute fuzzy matching scores.
+            original_product_name = strip_color_words(original_product_name)
+
             # ENHANCEMENT: If storage/capacity column exists, combine it with product name
             # This improves matching for datasets that separate model and capacity
             # Example: "iPad Pro 2022 11" + "128GB" → "iPad Pro 2022 11 128GB"
@@ -4032,17 +4392,44 @@ def run_matching(
                     # Combine name + storage for better matching
                     original_product_name = f"{original_product_name} {storage_value}"
 
-            query = build_match_string(input_brand, original_product_name)
-            match_result = match_single_item(
-                query, nl_lookup, nl_names, threshold,
-                brand_index=brand_index,
-                input_brand=input_brand,
-                attribute_index=attribute_index,
-                nl_catalog=nl_catalog,
-                original_input=original_product_name,
-                input_category=input_category,
-                signature_index=signature_index,
-            )
+            # Skip matching if we have no usable product name
+            if not original_product_name or original_product_name.lower() in ('nan', 'none', ''):
+                match_result = {
+                    'mapped_uae_assetid': '',
+                    'match_score': 0,
+                    'match_status': MATCH_STATUS_NO_MATCH,
+                    'confidence': CONFIDENCE_LOW,
+                    'matched_on': '',
+                    'method': 'skipped',
+                    'auto_selected': False,
+                    'selection_reason': '',
+                    'alternatives': [],
+                }
+                if not no_match_reason:
+                    no_match_reason = 'EMPTY_PRODUCT_NAME'
+            else:
+                query = build_match_string(input_brand, original_product_name)
+                match_result = match_single_item(
+                    query, nl_lookup, nl_names, threshold,
+                    brand_index=brand_index,
+                    input_brand=input_brand,
+                    attribute_index=attribute_index,
+                    nl_catalog=nl_catalog,
+                    original_input=original_product_name,
+                    input_category=input_category,
+                    signature_index=signature_index,
+                )
+                # Set no_match_reason based on result
+                if match_result.get('match_status') == MATCH_STATUS_NO_MATCH and not no_match_reason:
+                    score = match_result.get('match_score', 0)
+                    if score == 0:
+                        no_match_reason = 'NO_CANDIDATES_FOUND'
+                    elif score < threshold:
+                        no_match_reason = 'FUZZY_SCORE_TOO_LOW'
+                    else:
+                        no_match_reason = 'VARIANT_MISMATCH'
+                elif match_result.get('match_status') in (MATCH_STATUS_MATCHED, MATCH_STATUS_MULTIPLE):
+                    no_match_reason = 'SUCCESS'
         except Exception:
             match_result = {
                 'mapped_uae_assetid': '',
@@ -4055,13 +4442,20 @@ def run_matching(
                 'selection_reason': '',
                 'alternatives': [],
             }
+            if not no_match_reason:
+                no_match_reason = 'PROCESSING_ERROR'
 
         # --- Original input fields (always included for Excel export) ---
         # Attach the original product name so export code never has to guess column names
         match_result['original_input'] = original_product_name
 
+        # --- NO_MATCH_REASON debug column ---
+        match_result['no_match_reason'] = no_match_reason
+
         # --- Category column (always included for Excel export) ---
-        match_result['category'] = extract_category(query) if query else ''
+        match_result['category'] = extract_category(query) if query else (
+            extract_category(original_product_name) if original_product_name else ''
+        )
 
         # --- Verification columns (always included for Excel export) ---
         matched_on = match_result.get('matched_on', '')
@@ -4442,8 +4836,9 @@ BRAND_KEYWORDS = ['manufacturer', 'brand', 'make', 'oem', 'vendor']
 CATEGORY_KEYWORDS = ['type', 'category', 'device type', 'device_type', 'devicetype', 'product type', 'product_type']
 NAME_KEYWORDS = ['name', 'product', 'model', 'description', 'desc', 'foxway', 'device', 'item', 'asset', 'equipment']
 STORAGE_KEYWORDS = ['capacity', 'storage', 'size', 'memory']
-# Columns to EXCLUDE from name detection (these are IDs, not product names)
-NAME_EXCLUDE_KEYWORDS = ['id', 'serial', 'imei', 'barcode', 'sku', 'code', 'number']
+# Columns to EXCLUDE from name detection (IDs, URLs, slugs, prices — not product names)
+NAME_EXCLUDE_KEYWORDS = ['id', 'serial', 'imei', 'barcode', 'sku', 'code', 'number',
+                         'slug', 'url', 'link', 'href', 'path', 'price', 'image', 'thumbnail']
 
 # Sheets to skip when auto-detecting asset lists (the NL reference is handled separately)
 NL_SHEET_KEYWORDS = ['northladder', 'nl list', 'nl_list', 'reference', 'master']
@@ -4489,10 +4884,30 @@ def _detect_category_column(columns: List[str]) -> str:
 def _detect_name_column(columns: List[str]) -> str:
     """
     Detect the product name column.
-    Priority: model > name > product > description
-    Excludes category columns to prevent conflicts.
+
+    Priority order:
+      1. Exact match on known product-name column names (product_name, product title, etc.)
+      2. "model" keyword (excluding IDs)
+      3. General NAME_KEYWORDS (excluding category/ID/URL columns)
+
+    This ensures 'product_name' is always preferred over 'product_slug' or 'url'.
     """
-    # Priority 1: Look for "model" keyword first
+    # Priority 1: Exact match on well-known product name column names
+    EXACT_NAME_COLUMNS = [
+        'product_name', 'product name', 'productname',
+        'product title', 'product_title', 'producttitle',
+        'asset name', 'asset_name', 'assetname',
+        'model_name', 'model name', 'modelname',
+        'device_name', 'device name', 'devicename',
+        'item_name', 'item name', 'itemname',
+        'title', 'name',
+    ]
+    for exact in EXACT_NAME_COLUMNS:
+        for col in columns:
+            if col.lower().strip() == exact:
+                return col
+
+    # Priority 2: Look for "model" keyword first
     for col in columns:
         col_lower = col.lower().strip()
         if 'model' in col_lower and 'type' not in col_lower:
@@ -4501,7 +4916,7 @@ def _detect_name_column(columns: List[str]) -> str:
                 continue
             return col
 
-    # Priority 2: Look for other name keywords, but exclude category and ID columns
+    # Priority 3: Look for other name keywords, but exclude category and ID/URL columns
     for col in columns:
         col_lower = col.lower().strip()
         col_normalized = col_lower.replace(' ', '_')
@@ -4510,7 +4925,7 @@ def _detect_name_column(columns: List[str]) -> str:
         if any(kw.replace(' ', '_') in col_normalized for kw in CATEGORY_KEYWORDS):
             continue
 
-        # Skip if this looks like an ID column (e.g., "Asset ID", "Serial Number")
+        # Skip if this looks like an ID/URL/slug column
         if any(excl in col_lower for excl in NAME_EXCLUDE_KEYWORDS):
             continue
 
@@ -4845,6 +5260,52 @@ def self_test_verification() -> List[str]:
         ('dell latitude core i5 11th gen 16gb 512gb',
          'dell latitude core i5 11th gen 16gb 512gb', True,
          'Exact laptop match should pass'),
+
+        # --- OPPO RENO VARIANT TESTS ---
+        # 21. Reno2 Z must NOT match Reno Z (missing generation digit)
+        ('oppo reno2 z 128gb', 'oppo reno series reno z 128gb', False,
+         'Reno2 Z vs Reno Z should fail (generation mismatch)'),
+        # 22. Reno4 Z must NOT match Reno5 Z (different generation)
+        ('oppo reno4 z 128gb', 'oppo reno5 series reno5 z 128gb', False,
+         'Reno4 Z vs Reno5 Z should fail (reno4 vs reno5)'),
+        # 23. Reno7 Z must NOT match Reno5 Z (different generation)
+        ('oppo reno7 z 128gb', 'oppo reno5 series reno5 z 128gb', False,
+         'Reno7 Z vs Reno5 Z should fail (reno7 vs reno5)'),
+        # 24. Reno Z vs Reno Z should PASS (same base model, no digit on either side)
+        ('oppo reno z 128gb', 'oppo reno series reno z 128gb', True,
+         'Reno Z vs Reno Z should pass (consistent)'),
+        # 25. Reno2 vs Reno2 should PASS (same model)
+        ('oppo reno2 128gb', 'oppo reno2 series reno2 128gb', True,
+         'Reno2 vs Reno2 should pass (exact match)'),
+        # 26. Reno2 Z vs Reno2 (without Z) should FAIL (Z variant is distinct)
+        ('oppo reno2 z 128gb', 'oppo reno2 series reno2 128gb', False,
+         'Reno2 Z vs Reno2 (no Z) should fail (Z variant mismatch)'),
+
+        # --- XIAOMI / POCO / REDMI VARIANT TESTS ---
+        # 27. Poco F4 GT vs Poco F4 (GT variant lost)
+        ('poco f4 gt 128gb', 'poco f4 128gb', False,
+         'Poco F4 GT vs F4 should fail (GT variant)'),
+        # 28. Redmi Note 12 Turbo vs Redmi Note 12 (Turbo variant lost)
+        ('redmi note 12 turbo 256gb', 'redmi note 12 256gb', False,
+         'Note 12 Turbo vs Note 12 should fail (Turbo variant)'),
+        # 29. Xiaomi 14 Ultra vs Xiaomi 14 Ultra Photography Kit (bundle mismatch)
+        ('xiaomi 14 ultra 256gb', 'xiaomi 14 ultra photography kit 256gb', False,
+         'Xiaomi 14 Ultra vs Photography Kit should fail (kit suffix)'),
+        # 30. Correct Poco match should pass
+        ('poco f4 gt 128gb', 'poco f4 gt 128gb', True,
+         'Poco F4 GT exact match should pass'),
+        # 31. Correct Redmi match should pass
+        ('redmi note 12 turbo 256gb', 'redmi note 12 turbo 256gb', True,
+         'Note 12 Turbo exact match should pass'),
+        # 32. OPPO Reno cross-generation: Reno4 Pro vs Reno3 Pro
+        ('oppo reno4 pro 128gb', 'oppo reno3 pro 128gb', False,
+         'Reno4 Pro vs Reno3 Pro should fail (generation mismatch)'),
+        # 33. OPPO Reno cross-generation: Reno8 vs Reno5
+        ('oppo reno8 128gb', 'oppo reno5 128gb', False,
+         'Reno8 vs Reno5 should fail (generation mismatch)'),
+        # 34. OPPO Reno cross-generation: Reno10 Pro vs Reno6
+        ('oppo reno10 pro 128gb', 'oppo reno6 128gb', False,
+         'Reno10 Pro vs Reno6 should fail (generation + variant mismatch)'),
     ]
 
     for query, candidate, expected_pass, desc in cases:
@@ -5575,5 +6036,132 @@ def self_test_verification() -> List[str]:
         failures.append('FAIL: match_laptop_by_attributes should accept exact gen match')
     elif laptop_result_117.get('mapped_uae_assetid') != 'NL-LAPTOP-GEN11':
         failures.append(f'FAIL: Expected NL-LAPTOP-GEN11, got {laptop_result_117.get("mapped_uae_assetid")}')
+
+    # === OPPO RENO MODEL TOKEN EXTRACTION TESTS ===
+
+    # Reno2 Z must produce tokens including generation digit "2" AND "z" variant
+    # (after de-concat: "reno2" → "reno 2", so token is "2" not "reno2")
+    reno2z_tokens = extract_model_tokens(normalize_text('oppo reno2 z 128gb'))
+    if '2' not in reno2z_tokens:
+        failures.append(f'FAIL: Reno2 Z tokens missing "2" - got {reno2z_tokens}')
+    if 'z' not in reno2z_tokens:
+        failures.append(f'FAIL: Reno2 Z tokens missing "z" variant - got {reno2z_tokens}')
+
+    # Reno4 Z must produce tokens with "4" and "z"
+    reno4z_tokens = extract_model_tokens(normalize_text('oppo reno4 z 5g 128gb'))
+    if '4' not in reno4z_tokens:
+        failures.append(f'FAIL: Reno4 Z tokens missing "4" - got {reno4z_tokens}')
+    if 'z' not in reno4z_tokens:
+        failures.append(f'FAIL: Reno4 Z tokens missing "z" variant - got {reno4z_tokens}')
+
+    # Reno Z (no digit) must produce "z" token but NOT any numbered reno
+    renoz_tokens = extract_model_tokens(normalize_text('oppo reno z 128gb'))
+    if 'z' not in renoz_tokens:
+        failures.append(f'FAIL: Reno Z tokens missing "z" variant - got {renoz_tokens}')
+
+    # Reno2 (without Z) must have "2" but NOT "z"
+    reno2_tokens = extract_model_tokens(normalize_text('oppo reno2 128gb'))
+    if '2' not in reno2_tokens:
+        failures.append(f'FAIL: Reno2 tokens missing "2" - got {reno2_tokens}')
+    if 'z' in reno2_tokens:
+        failures.append(f'FAIL: Reno2 (no Z) should not have "z" token - got {reno2_tokens}')
+
+    # Samsung Galaxy Z Fold must NOT be affected by Reno Z logic
+    fold_tokens = extract_model_tokens(normalize_text('samsung galaxy z fold5 256gb'))
+    if 'z' in fold_tokens:
+        failures.append(f'FAIL: Galaxy Z Fold5 should not pick up "z" as Reno variant - got {fold_tokens}')
+    if 'fold5' not in fold_tokens:
+        failures.append(f'FAIL: Galaxy Z Fold5 missing "fold5" token - got {fold_tokens}')
+
+    # verify_critical_attributes: Reno2 Z vs Reno Z must FAIL
+    vca_reno = verify_critical_attributes(
+        normalize_text('oppo reno2 z 128gb'),
+        normalize_text('oppo reno series reno z 128gb'))
+    if vca_reno:
+        failures.append('FAIL: verify_critical_attributes should reject Reno2 Z vs Reno Z')
+
+    # verify_critical_attributes: Reno4 Z vs Reno5 Z must FAIL
+    vca_reno45 = verify_critical_attributes(
+        normalize_text('oppo reno4 z 5g 128gb'),
+        normalize_text('oppo reno5 series reno5 z 5g 128gb'))
+    if vca_reno45:
+        failures.append('FAIL: verify_critical_attributes should reject Reno4 Z vs Reno5 Z')
+
+    # verify_critical_attributes: Reno Z vs Reno Z must PASS
+    vca_renozz = verify_critical_attributes(
+        normalize_text('oppo reno z 128gb'),
+        normalize_text('oppo reno series reno z 128gb'))
+    if not vca_renozz:
+        failures.append('FAIL: verify_critical_attributes should accept Reno Z vs Reno Z')
+
+    # === MODEL IDENTITY GUARDRAIL TESTS ===
+
+    # extract_model_identity correctness
+    _id_cases = [
+        ('Oppo Reno4 Pro 128GB', 'reno4pro'),
+        ('Oppo Reno6 Dual 128GB', 'reno6'),
+        ('Oppo Reno10 Pro 5G', 'reno10pro'),
+        ('Redmi Note 12 Turbo', 'note12turbo'),
+        ('Poco F4 GT 128GB', 'pocof4gt'),
+        ('Xiaomi 14 Ultra', 'xiaomi14ultra'),
+        ('Apple iPhone 15 Pro', ''),
+        ('Samsung Galaxy S23', ''),
+    ]
+    for text, expected_id in _id_cases:
+        actual_id = extract_model_identity(text)
+        if actual_id != expected_id:
+            failures.append(
+                f'FAIL: extract_model_identity("{text}") = "{actual_id}", expected "{expected_id}"')
+
+    # model_identity_guardrail rejections
+    _guard_cases = [
+        ('oppo reno4 pro 128gb', 'oppo reno3 pro 128gb', False),
+        ('poco f4 gt 128gb', 'poco f4 128gb', False),
+        ('redmi note 12 turbo', 'redmi note 12', False),
+        ('oppo reno4 pro 128gb', 'oppo reno4 pro 128gb', True),
+        ('apple iphone 15 pro', 'apple iphone 15 pro', True),
+    ]
+    for q_g, c_g, expected_pass in _guard_cases:
+        actual_pass, _ = model_identity_guardrail(q_g, c_g)
+        if actual_pass != expected_pass:
+            failures.append(
+                f'FAIL: model_identity_guardrail("{q_g}", "{c_g}") = {actual_pass}, '
+                f'expected {expected_pass}')
+
+    # ----- OPPO Reno extraction tests (de-concat + series stripping) -----
+    _reno_extraction_cases = [
+        # (input_text, brand, expected_line, expected_model)
+        ('OPPO Reno4 128GB', 'oppo', 'reno', '4'),
+        ('OPPO Reno6 Dual 128GB', 'oppo', 'reno', '6'),
+        ('OPPO Reno8 5G Dual 128GB', 'oppo', 'reno', '8'),
+        ('OPPO Reno3 Pro 256GB', 'oppo', 'reno', '3 pro'),
+        ('OPPO Reno10 Pro 5G Dual 256GB', 'oppo', 'reno', '10 pro'),
+        # NL catalog entries (with "series" noise)
+        ('oppo reno2 series reno2 128gb', 'oppo', 'reno', '2'),
+        ('oppo reno3 series reno3 pro 256gb', 'oppo', 'reno', '3 pro'),
+        ('oppo reno5 series reno5 5g 128gb', 'oppo', 'reno', '5'),
+        ('oppo reno6 series reno6 5g 256gb', 'oppo', 'reno', '6'),
+        # OPPO Find
+        ('OPPO Find X5 Pro 256GB', 'oppo', 'find', 'x5 pro'),
+        ('oppo find x5 series find x5 pro 256gb', 'oppo', 'find', 'x5 pro'),
+    ]
+    for text_r, brand_r, exp_line, exp_model in _reno_extraction_cases:
+        norm_r = normalize_text(text_r)
+        attrs_r = extract_product_attributes(norm_r, brand_r)
+        if attrs_r['product_line'] != exp_line or attrs_r['model'] != exp_model:
+            failures.append(
+                f'FAIL: extract_product_attributes("{text_r}") = '
+                f'line={attrs_r["product_line"]!r}, model={attrs_r["model"]!r}, '
+                f'expected line={exp_line!r}, model={exp_model!r}')
+
+    # Cross-generation attribute mismatch: Reno4 query must NOT share model key with Reno2 NL entry
+    q_norm = normalize_text('OPPO Reno4 128GB')
+    q_attrs = extract_product_attributes(q_norm, 'oppo')
+    nl_norm = normalize_text('oppo reno2 series reno2 128gb')
+    nl_attrs = extract_product_attributes(nl_norm, 'oppo')
+    if q_attrs['model'] == nl_attrs['model']:
+        failures.append(
+            f'FAIL: Reno4 query model={q_attrs["model"]!r} should differ from '
+            f'Reno2 NL model={nl_attrs["model"]!r} — cross-generation collision!')
 
     return failures
