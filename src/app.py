@@ -19,8 +19,8 @@ from matcher import (
     build_nl_lookup,
     build_brand_index,
     build_attribute_index,
+    build_signature_index,
     run_matching,
-    test_single_match,
     parse_nl_sheet,
     parse_asset_sheets,
     save_nl_reference,
@@ -52,6 +52,43 @@ st.set_page_config(
 
 st.title("🔗 NorthLadder UAE Asset ID Mapper")
 st.markdown("**Intelligent fuzzy matching with attribute verification and hybrid indexing**")
+
+# ---------------------------------------------------------------------------
+# Data Hygiene: Device Type Normalization
+# ---------------------------------------------------------------------------
+def normalize_device_type(device_type_str):
+    """
+    Normalize inconsistent device type names to canonical categories.
+
+    Mappings:
+    - ipads, ipad → tablet
+    - tablet's, tablets → tablet
+    - mobile phone, phone, mobiles → mobile
+    - smartwatch, smart watch → smartwatch
+    - laptop, laptops → laptop
+    """
+    if not isinstance(device_type_str, str):
+        return str(device_type_str).lower().strip()
+
+    normalized = device_type_str.lower().strip()
+
+    # Tablet variants
+    if normalized in ('ipads', 'ipad', 'tablet\'s', 'tablets'):
+        return 'tablet'
+
+    # Mobile variants
+    if normalized in ('mobile phone', 'phone', 'mobiles', 'cell phone'):
+        return 'mobile'
+
+    # Smartwatch variants
+    if normalized in ('smart watch', 'smartwatches', 'watch'):
+        return 'smartwatch'
+
+    # Laptop variants
+    if normalized in ('laptops', 'notebook', 'notebooks'):
+        return 'laptop'
+
+    return normalized
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -118,6 +155,7 @@ def load_nl_catalog():
     nl_names = list(nl_lookup.keys())
     nl_brand_index = build_brand_index(df_nl_clean)
     nl_attribute_index = build_attribute_index(df_nl_clean)
+    nl_signature_index = build_signature_index(df_nl_clean)
 
     return {
         'df': df_nl_clean,
@@ -126,6 +164,7 @@ def load_nl_catalog():
         'names': nl_names,
         'brand_index': nl_brand_index,
         'attribute_index': nl_attribute_index,
+        'signature_index': nl_signature_index,
     }
 
 # Load catalog (will be cached after first load)
@@ -145,6 +184,7 @@ nl_lookup = catalog['lookup']
 nl_names = catalog['names']
 nl_brand_index = catalog['brand_index']
 nl_attribute_index = catalog['attribute_index']
+nl_signature_index = catalog['signature_index']
 
 st.success(
     f"NL Reference: **{nl_stats.get('final', len(df_nl_clean)):,}** asset records loaded "
@@ -423,31 +463,78 @@ with tab1:
 
     st.divider()
 
-    # Matching Flow Diagram
-    st.subheader("🔄 Matching Process Flow")
+    # Hardened Matching Explanation
+    st.subheader("🔄 How the Matching Engine Works")
     st.markdown("""
-    ```
-    1. Upload Asset Lists
-       ↓
-    2. Auto-detect Sheets & Columns
-       ↓
-    3. Hybrid Matching Engine
-       ├─ Attribute Matching (Fast Path - 70-80% of queries)
-       │  └─ Exact brand + model + storage match
-       └─ Fuzzy Matching (Fallback)
-          ├─ Brand Partitioning
-          ├─ Storage Pre-filtering
-          ├─ Token Sort Fuzzy Match
-          └─ Model Token Guardrail
-       ↓
-    4. Auto-Select for Multiple Variants
-       └─ Matches user's exact specs (year, 5G/4G)
-       ↓
-    5. Results Classification
-       ├─ ✅ MATCHED (≥90%, auto-selected if multiple IDs)
-       ├─ 🟡 REVIEW (85-94%, attributes differ)
-       └─ 🔴 NO_MATCH (<85%)
-    ```
+    The NorthLadder Asset Mapper uses a **hardened multi-stage matching pipeline** to ensure accurate results
+    while preventing false positives:
+    """)
+
+    st.markdown("""
+    **Matching Pipeline:**
+
+    1️⃣ **Attribute Matching** (Fast Path)
+       - Extracts product attributes: brand, model, storage, category
+       - Matches against pre-built attribute index
+       - ~70-80% of queries match here instantly
+       - Example: "Apple iPhone 13 128GB" → exact attribute match
+
+    2️⃣ **Signature Matching** (Model Code Path)
+       - Uses hardware signatures (model codes, serial patterns)
+       - Matches products with specific identifiers
+       - Example: "Samsung SM-G960F" → signature match
+
+    3️⃣ **Fuzzy Matching** (Fallback)
+       - String similarity with brand partitioning
+       - Storage pre-filtering for efficiency
+       - Token-based comparison
+       - Only fires if attribute/signature matching fails
+
+    4️⃣ **Verification Gate** (Quality Control)
+       - **Mobile gate**: Exact model, variant (Pro/Max/Ultra), storage
+       - **Tablet gate**: Exact family (iPad Pro/Mini), screen size (±0.15"), generation, year
+       - **Laptop gate**: Exact processor, generation (no tolerance), RAM, storage
+       - Fuzzy matches **always downgraded** to REVIEW_REQUIRED
+       - Prevents false positives by requiring exact attribute alignment
+
+    5️⃣ **Results Classification:**
+       - ✅ **MATCHED** (≥90% score + passed verification gate)
+       - 🟡 **REVIEW_REQUIRED** (85-89% score OR failed gate)
+       - 🔴 **NO_MATCH** (<85% score)
+    """)
+
+    st.divider()
+
+    # Usage Guide
+    st.subheader("📖 How to Use This Tool")
+    st.markdown("""
+    **Step 1: Upload Your Asset Lists**
+    - Go to the **Mapping** tab
+    - Upload your Excel file with asset lists
+    - The tool auto-detects sheets and columns (Brand, Product Name)
+
+    **Step 2: Run Matching**
+    - Click "Run Asset Mapping"
+    - The engine processes each sheet automatically
+    - Progress bars show real-time status
+
+    **Step 3: Review Results**
+    - Download the Excel file with multiple sheets:
+      - **Matched**: Successfully mapped assets (ready to use)
+      - **Unmatched**: Items with no confident match (needs catalog expansion)
+      - **Review Required**: Good matches but attributes differ (manual verification)
+      - **Auto-Selected Products**: Items with multiple variants (shows selection logic)
+      - **Summary**: Overall statistics
+
+    **Step 4: Analyze Issues (Optional)**
+    - Use **Unmatched Analysis** tab to understand why items didn't match
+    - Check brand presence, score distribution, and close misses
+    - Identify missing products or data quality issues
+
+    **Advanced Features:**
+    - Enable "Show Advanced Options" in sidebar for manual variant override
+    - Use **Variant Selector** tab to review auto-selections
+    - Upload diagnostic reports to **Mapping Performance** tab for deep analysis
     """)
 
     st.divider()
@@ -490,9 +577,67 @@ with tab1:
 # =========================================================================
 with tab2:
     st.header("🔗 Asset Mapping")
-    st.markdown("Upload an Excel file with your asset lists — all sheets are auto-detected and matched.")
+    st.markdown("Upload an Excel or CSV file with your asset lists — all sheets are auto-detected and matched.")
 
-    asset_upload = st.file_uploader("📁 Upload Asset Lists (.xlsx)", type=["xlsx"], key="asset_upload")
+    # Sample template download
+    st.subheader("📥 Download Sample Template")
+    st.markdown("""
+    **New to the tool?** Download a sample template to see the required format.
+    The template shows the correct column names and data structure.
+    """)
+
+    # Create sample template DataFrame
+    sample_data = {
+        'Brand': ['Apple', 'Samsung', 'Dell', 'HP', 'Apple'],
+        'Product Name': [
+            'iPhone 14 Pro Max 256GB',
+            'Galaxy S23 Ultra 512GB',
+            'Latitude 5420 Intel Core i7 11th Gen 16GB 512GB',
+            'Pavilion Ryzen 5 8GB 256GB',
+            'iPad Pro 11 5th Gen WiFi 256GB'
+        ],
+        'Category': ['Mobile', 'Mobile', 'Laptop', 'Laptop', 'Tablet']
+    }
+    sample_df = pd.DataFrame(sample_data)
+
+    # Convert to Excel bytes
+    sample_excel = io.BytesIO()
+    with pd.ExcelWriter(sample_excel, engine='openpyxl') as writer:
+        sample_df.to_excel(writer, sheet_name='Asset List', index=False)
+    sample_excel.seek(0)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button(
+            label="📥 Download Excel Template",
+            data=sample_excel,
+            file_name="asset_list_template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+    with col2:
+        # CSV template
+        sample_csv = sample_df.to_csv(index=False)
+        st.download_button(
+            label="📥 Download CSV Template",
+            data=sample_csv,
+            file_name="asset_list_template.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
+    st.info("💡 **Tip:** Your file must have at least a **Product Name** column. Brand and Category columns are optional but recommended.")
+
+    st.divider()
+
+    # File uploader with CSV support
+    st.subheader("📤 Upload Your Asset List")
+    asset_upload = st.file_uploader(
+        "📁 Upload Asset Lists (.xlsx or .csv)",
+        type=["xlsx", "csv"],
+        key="asset_upload",
+        help="Upload an Excel file with multiple sheets or a CSV file with your asset list"
+    )
 
     if asset_upload is not None:
         try:
@@ -519,54 +664,6 @@ with tab2:
             for tab, (sheet_name, info) in zip(preview_tabs, detected_sheets.items()):
                 with tab:
                     st.dataframe(info['df'].head(10), use_container_width=True, hide_index=True)
-
-        # ------------------------------------------------------------------
-        # Test Single Match
-        # ------------------------------------------------------------------
-        st.divider()
-        st.subheader("🧪 Test Single Match")
-
-        # Get unique brands from catalog for dropdown
-        available_brands = sorted(df_nl_clean['brand'].unique())
-
-        tc1, tc2, tc3 = st.columns([2, 2, 1])
-        with tc1:
-            test_brand = st.selectbox(
-                "Brand",
-                options=available_brands,
-                index=available_brands.index("Apple") if "Apple" in available_brands else 0,
-                key="test_brand"
-            )
-        with tc2:
-            test_name = st.text_input("Product Name", value="iPhone 6 16GB", key="test_name")
-        with tc3:
-            st.write("")
-            st.write("")
-            test_btn = st.button("Test Match", use_container_width=True)
-
-        if test_btn:
-            result = test_single_match(test_brand, test_name, nl_lookup, nl_names, threshold,
-                                       brand_index=nl_brand_index, attribute_index=nl_attribute_index,
-                                       nl_catalog=df_nl_clean)
-            st.markdown(f"**Query:** `{result['query']}`")
-            if 'error' in result:
-                st.error(result['error'])
-            else:
-                best = result['best_match']
-                method = best.get('method', 'unknown')
-                method_emoji = "⚡" if method == "attribute" else "🔍" if method == "fuzzy" else "❓"
-                st.markdown(f"**Result:** `{best['match_status']}` (Score: {best['match_score']}%) {method_emoji} `{method}`")
-                if best['mapped_uae_assetid']:
-                    st.success(f"Asset ID: `{best['mapped_uae_assetid']}`")
-                    st.caption(f"Matched on: `{best['matched_on']}`")
-
-                st.caption(f"💡 Method: **{method.upper()}** - " +
-                          ("Fast attribute matching (0ms)" if method == "attribute" else
-                           "Fuzzy string matching" if method == "fuzzy" else "No match found"))
-
-                alt_df = pd.DataFrame(result['top_3_alternatives'])
-                alt_df['asset_ids'] = alt_df['asset_ids'].apply(lambda x: ', '.join(x) if x else 'N/A')
-                st.dataframe(alt_df[['nl_name', 'score', 'status', 'asset_ids']], use_container_width=True, hide_index=True)
 
         # ------------------------------------------------------------------
         # Run full mapping
@@ -596,8 +693,18 @@ with tab2:
                     brand_index=nl_brand_index,
                     attribute_index=nl_attribute_index,
                     nl_catalog=df_nl_clean,
+                    signature_index=nl_signature_index,
                 )
                 progress.progress(1.0, text=f"✅ {sheet_name} complete!")
+
+                # Data hygiene: Normalize device types to canonical categories
+                if 'category' in df_result.columns:
+                    df_result['category'] = df_result['category'].apply(normalize_device_type)
+
+                # Flatten mixed-type columns (lists/dicts) to strings for PyArrow compatibility
+                for col in ('alternatives', 'selection_reason'):
+                    if col in df_result.columns:
+                        df_result[col] = df_result[col].astype(str)
                 all_results[sheet_name] = df_result
 
                 matched = (df_result['match_status'] == MATCH_STATUS_MATCHED).sum()
@@ -692,11 +799,13 @@ with tab2:
                         unmatched.to_excel(writer, sheet_name=safe_name, index=False)
 
                 # 3. REVIEW REQUIRED sheet - All REVIEW_REQUIRED items (combined)
+                # Uses curated columns to avoid NaN when sheets have different input column names
+                # (e.g., List 1 has "manufacturer"/"name"/"type", List 2 has "Brand"/"Foxway Product Name"/"Category")
                 all_review_required = []
                 for sheet_name, df_result in all_results.items():
                     review = df_result[df_result['match_status'] == MATCH_STATUS_SUGGESTED].copy()
                     if len(review) > 0:
-                        # Add real NL product name column for review items too
+                        # Add real NL product name column for review items
                         nl_product_names = []
                         for idx, row in review.iterrows():
                             asset_id = row['mapped_uae_assetid']
@@ -704,23 +813,32 @@ with tab2:
                             nl_name = nl_entry.iloc[0]['uae_assetname'] if len(nl_entry) > 0 else 'N/A'
                             nl_product_names.append(nl_name)
 
-                        insert_pos = list(review.columns).index('mapped_uae_assetid') + 1
-                        review.insert(insert_pos, 'nl_product_name', nl_product_names)
+                        review['nl_product_name'] = nl_product_names
                         review.insert(0, 'Source Sheet', sheet_name)
                         all_review_required.append(review)
 
                 if all_review_required:
                     df_review_combined = pd.concat(all_review_required, ignore_index=True)
-                    df_review_combined.to_excel(writer, sheet_name='Review Required', index=False)
+                    # Build curated column set: canonical fields present in ALL sheets
+                    review_cols = [
+                        'Source Sheet', 'original_input', 'category',
+                        'mapped_uae_assetid', 'nl_product_name',
+                        'match_score', 'match_status', 'confidence',
+                        'matched_on', 'method',
+                        'auto_selected', 'selection_reason', 'alternatives',
+                        'verification_pass', 'verification_reasons',
+                    ]
+                    # Only include columns that actually exist
+                    review_cols = [c for c in review_cols if c in df_review_combined.columns]
+                    df_review_combined[review_cols].to_excel(writer, sheet_name='Review Required', index=False)
 
                 # 4. AUTO-SELECTED PRODUCTS sheet - All auto-selected items with details
                 auto_selected_details = []
                 for sheet_name, df_result in all_results.items():
                     auto_selected = df_result[df_result['auto_selected'] == True].copy()
                     for idx, row in auto_selected.iterrows():
-                        # Get original product name
-                        name_col = 'name' if 'name' in row else 'Foxway Product Name'
-                        original_name = row[name_col] if name_col in row else ''
+                        # Get original product name from the canonical field
+                        original_name = str(row.get('original_input', ''))
 
                         # Parse alternatives
                         alternatives_raw = row.get('alternatives', '')
@@ -863,9 +981,8 @@ if tab3 is not None:
 
             for sheet_name, auto_selected in all_auto_selected:
                 for idx, row in auto_selected.iterrows():
-                    # Get product name
-                    name_col = 'name' if 'name' in row else 'Foxway Product Name'
-                    user_input = str(row[name_col]) if name_col in row else ''
+                    # Get product name from canonical field
+                    user_input = str(row.get('original_input', ''))
 
                     selected_id = row['mapped_uae_assetid']
                     selection_reason = row.get('selection_reason', '')
@@ -982,8 +1099,7 @@ if tab3 is not None:
                 st.markdown(f"**Showing first {min(20, len(all_items_flat))} of {len(all_items_flat)} items**")
 
                 for i, (sheet_name, idx, row) in enumerate(all_items_flat[:20]):
-                    name_col = 'name' if 'name' in row else 'Foxway Product Name'
-                    product_name = row[name_col] if name_col in row else ''
+                    product_name = str(row.get('original_input', ''))
 
                     with st.expander(f"Item {i+1}: {product_name}"):
                         # Show match info
@@ -1075,7 +1191,7 @@ if tab3 is not None:
                                 safe_name = f"{sheet_name} - Unmatched"[:31]
                                 unmatched.to_excel(writer, sheet_name=safe_name, index=False)
 
-                        # 3. REVIEW REQUIRED sheet
+                        # 3. REVIEW REQUIRED sheet (curated columns to avoid NaN across sheets)
                         all_review_required = []
                         for sheet_name, df_result in all_dataframes.items():
                             review = df_result[df_result['match_status'] == MATCH_STATUS_SUGGESTED].copy()
@@ -1085,15 +1201,22 @@ if tab3 is not None:
 
                         if all_review_required:
                             df_review_combined = pd.concat(all_review_required, ignore_index=True)
-                            df_review_combined.to_excel(writer, sheet_name='Review Required', index=False)
+                            review_cols = [
+                                'Source Sheet', 'original_input', 'category',
+                                'mapped_uae_assetid', 'match_score', 'match_status',
+                                'confidence', 'matched_on', 'method',
+                                'auto_selected', 'selection_reason', 'alternatives',
+                                'verification_pass', 'verification_reasons',
+                            ]
+                            review_cols = [c for c in review_cols if c in df_review_combined.columns]
+                            df_review_combined[review_cols].to_excel(writer, sheet_name='Review Required', index=False)
 
                         # 4. AUTO-SELECTED PRODUCTS sheet (with overrides marked)
                         auto_selected_details = []
                         for sheet_name, df_result in all_dataframes.items():
                             auto_selected = df_result[df_result['auto_selected'] == True].copy()
                             for idx, row in auto_selected.iterrows():
-                                name_col = 'name' if 'name' in row else 'Foxway Product Name'
-                                original_name = row[name_col] if name_col in row else ''
+                                original_name = str(row.get('original_input', ''))
 
                                 alternatives_raw = row.get('alternatives', '')
                                 if isinstance(alternatives_raw, str) and alternatives_raw:
@@ -1249,14 +1372,15 @@ with tab4:
 
         df_unmatched = pd.concat(unmatched_items, ignore_index=True)
 
-        # Identify name column
-        name_col = 'name' if 'name' in df_unmatched.columns else 'Foxway Product Name'
+        # Identify name column — prefer canonical 'original_input', fall back to legacy names
+        name_col = 'original_input' if 'original_input' in df_unmatched.columns else (
+            'name' if 'name' in df_unmatched.columns else 'Foxway Product Name')
         brand_col = 'brand' if 'brand' in df_unmatched.columns else None
 
         # Breakdown by reason
         st.markdown("**Why did these items fail to match?**")
 
-        analysis_tabs = st.tabs(["📊 Overview", "🏢 Brand Analysis", "📉 Score Distribution", "📋 Details"])
+        analysis_tabs = st.tabs(["📊 Overview", "🏢 Brand Analysis", "📋 Details"])
 
         with analysis_tabs[0]:  # Overview
             st.markdown(f"**Total unmatched items:** {len(df_unmatched):,}")
@@ -1309,30 +1433,7 @@ with tab4:
             else:
                 st.info("Brand information not available for analysis.")
 
-        with analysis_tabs[2]:  # Score Distribution
-            if 'match_score' in df_unmatched.columns:
-                st.markdown("**Match Score Distribution:**")
-
-                # Show histogram
-                score_data = df_unmatched['match_score'].dropna()
-                if len(score_data) > 0:
-                    st.bar_chart(score_data.value_counts().sort_index())
-
-                    # Show close misses (80-84%)
-                    close_misses = df_unmatched[(df_unmatched['match_score'] >= 80) & (df_unmatched['match_score'] < 85)]
-                    if len(close_misses) > 0:
-                        st.markdown(f"**🎯 Close Misses (80-84%):** {len(close_misses)} items")
-                        st.caption("These items are very close to matching. Check for:")
-                        st.caption("- Minor spelling differences")
-                        st.caption("- Extra/missing words")
-                        st.caption("- Different formatting")
-
-                        with st.expander(f"View {len(close_misses)} close miss items"):
-                            display_cols = ['Source Sheet', name_col, 'match_score', 'matched_on']
-                            display_cols = [col for col in display_cols if col in close_misses.columns]
-                            st.dataframe(close_misses[display_cols], use_container_width=True, hide_index=True)
-
-        with analysis_tabs[3]:  # Details
+        with analysis_tabs[2]:  # Details
             st.markdown("**All Unmatched Items:**")
             display_cols = ['Source Sheet', name_col, 'match_score', 'matched_on']
             if brand_col and brand_col in df_unmatched.columns:
@@ -1348,8 +1449,9 @@ with tab4:
 
         df_review = pd.concat(review_items, ignore_index=True)
 
-        # Identify name column
-        name_col = 'name' if 'name' in df_review.columns else 'Foxway Product Name'
+        # Identify name column — prefer canonical 'original_input', fall back to legacy names
+        name_col = 'original_input' if 'original_input' in df_review.columns else (
+            'name' if 'name' in df_review.columns else 'Foxway Product Name')
 
         st.markdown(f"**Total items needing review:** {len(df_review):,}")
         st.caption("These items have good similarity scores but attributes (model/storage) don't match exactly.")
@@ -1391,31 +1493,34 @@ with tab4:
 # TAB 5: MAPPING PERFORMANCE DASHBOARD
 # =========================================================================
 with tab5:
-    st.header("📊 Mapping Performance Dashboard")
-    st.markdown("Upload a diagnostic report Excel file to visualize mapping performance, coverage, and risks.")
+    # COMMENTED OUT FOR MANAGER DEMO - Performance dashboard hidden
+    st.info("📊 Performance dashboard is currently disabled for this demo version.")
 
-    diag_upload = st.file_uploader(
-        "📁 Upload Diagnostic Report (.xlsx)",
-        type=["xlsx"],
-        key="diag_upload",
-        help="Upload match_diagnostic_report_batch3.xlsx or any diagnostic report generated by the matching engine.",
-    )
+    # st.header("📊 Mapping Performance Dashboard")
+    # st.markdown("Upload a diagnostic report Excel file to visualize mapping performance, coverage, and risks.")
 
-    if diag_upload is not None:
-        df_diag = load_diagnostic_report(diag_upload)
-        if df_diag is not None and len(df_diag) > 0:
-            st.success(f"Loaded {len(df_diag):,} rows from diagnostic report. Columns: {len(df_diag.columns)}")
-            render_dashboard(df_diag)
-        else:
-            st.error("Failed to load diagnostic report or file is empty.")
-    else:
-        st.info("Upload a diagnostic report to view the performance dashboard.")
-        st.markdown("""
-        **How to generate a diagnostic report:**
-        1. Run the mapping in the **Mapping** tab
-        2. Or use `run_matching(..., diagnostic=True)` in Python
-        3. The report should contain columns like `match_status`, `match_score`, `method`, etc.
-        """)
+    # diag_upload = st.file_uploader(
+    #     "📁 Upload Diagnostic Report (.xlsx)",
+    #     type=["xlsx"],
+    #     key="diag_upload",
+    #     help="Upload match_diagnostic_report_batch3.xlsx or any diagnostic report generated by the matching engine.",
+    # )
+
+    # if diag_upload is not None:
+    #     df_diag = load_diagnostic_report(diag_upload)
+    #     if df_diag is not None and len(df_diag) > 0:
+    #         st.success(f"Loaded {len(df_diag):,} rows from diagnostic report. Columns: {len(df_diag.columns)}")
+    #         render_dashboard(df_diag)
+    #     else:
+    #         st.error("Failed to load diagnostic report or file is empty.")
+    # else:
+    #     st.info("Upload a diagnostic report to view the performance dashboard.")
+    #     st.markdown("""
+    #     **How to generate a diagnostic report:**
+    #     1. Run the mapping in the **Mapping** tab
+    #     2. Or use `run_matching(..., diagnostic=True)` in Python
+    #     3. The report should contain columns like `match_status`, `match_score`, `method`, etc.
+    #     """)
 
 # ---------------------------------------------------------------------------
 # Footer

@@ -1,5 +1,18 @@
+# Python
 venv/
 __pycache__/
 *.pyc
-*.xlsx
+
+# Streamlit
 .streamlit/
+
+# Outputs (generated results, reports, CSVs)
+outputs/
+
+# NL reference cache (regenerated at runtime)
+src/nl_reference/
+
+# OS artifacts
+nul
+.DS_Store
+Thumbs.db

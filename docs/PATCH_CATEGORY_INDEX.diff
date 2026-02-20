@@ -1,0 +1,89 @@
+--- a/matcher.py	(original)
++++ b/matcher.py	(fixed - add category layer to attribute index)
+@@ -548,7 +548,9 @@ def build_attribute_index(df_nl_clean: pd.DataFrame) -> Dict:
+     """
+     Build an attribute-based index for fast exact matching.
+
+-    Returns nested dict: brand → product_line → model → ram_storage_key → [asset_ids]
++    Returns nested dict: brand → category → product_line → model → ram_storage_key → [asset_ids]
++
++    CRITICAL: Category is added as a layer to prevent cross-category collisions like MacBook Pro / iPad Pro.
+
+     For phones: brand → product_line → model → storage
+     For laptops: brand → product_line → model (CPU gen) → "ram_storage" (combined key)
+@@ -560,6 +562,9 @@ def build_attribute_index(df_nl_clean: pd.DataFrame) -> Dict:
+     for _, row in df_nl_clean.iterrows():
+         brand = normalize_text(str(row.get('brand', '')).strip())
+         if not brand:
+             continue
+
++        # CRITICAL FIX: Extract category for this NL row to prevent cross-category collisions
++        row_category = extract_category(row['normalized_name'])
++
+         attrs = extract_product_attributes(row['normalized_name'], brand)
+
+         # Only index if we successfully extracted model
+@@ -568,14 +573,18 @@ def build_attribute_index(df_nl_clean: pd.DataFrame) -> Dict:
+
+-        # Build nested structure
++        # Build nested structure with category layer
+         if brand not in index:
+             index[brand] = {}
+-        if attrs['product_line'] not in index[brand]:
+-            index[brand][attrs['product_line']] = {}
+-        if attrs['model'] not in index[brand][attrs['product_line']]:
+-            index[brand][attrs['product_line']][attrs['model']] = {}
++        if row_category not in index[brand]:
++            index[brand][row_category] = {}
++        if attrs['product_line'] not in index[brand][row_category]:
++            index[brand][row_category][attrs['product_line']] = {}
++        if attrs['model'] not in index[brand][row_category][attrs['product_line']]:
++            index[brand][row_category][attrs['product_line']][attrs['model']] = {}
+
+-        # Build storage key based on category
++        # Build storage key based on category (watches: mm+connectivity, laptops: ram+storage, phones: storage)
+         # Watches: use mm + connectivity (CRITICAL: 42mm vs 46mm are different products!)
+         # Laptops: use RAM + storage
+         # Phones/Tablets: use storage only
+@@ -595,12 +604,12 @@ def build_attribute_index(df_nl_clean: pd.DataFrame) -> Dict:
+             # Phone/tablet key: storage only
+             storage_key = attrs['storage']
+
+-        if storage_key not in index[brand][attrs['product_line']][attrs['model']]:
+-            index[brand][attrs['product_line']][attrs['model']][storage_key] = {
++        if storage_key not in index[brand][row_category][attrs['product_line']][attrs['model']]:
++            index[brand][row_category][attrs['product_line']][attrs['model']][storage_key] = {
+                 'asset_ids': [],
+                 'nl_name': row['normalized_name']
+             }
+
+         asset_id = str(row['uae_assetid']).strip()
+-        entry = index[brand][attrs['product_line']][attrs['model']][storage_key]
++        entry = index[brand][row_category][attrs['product_line']][attrs['model']][storage_key]
+         if asset_id not in entry['asset_ids']:
+             entry['asset_ids'].append(asset_id)
+
+@@ -619,6 +628,9 @@ def try_attribute_match(
+     """
+     Attempt fast attribute-based matching before falling back to fuzzy.
+
++    CRITICAL: Now uses category layer in attribute index lookup to prevent
++    MacBook Pro / iPad Pro / AirPods Pro collisions.
++
+     Returns match result dict if confident match found, None otherwise.
+     This is the "fast path" that handles phones and laptops in 2-5ms.
+     """
+@@ -635,9 +647,10 @@ def try_attribute_match(
+
+     # Navigate the index
+     try:
++        # CRITICAL FIX: Add category layer to lookup path
+         brand_data = attribute_index.get(attrs['brand'], {})
+-        line_data = brand_data.get(attrs['product_line'], {})
+-        model_data = line_data.get(attrs['model'], {})
++        category_data = brand_data.get(query_category, {})
++        line_data = category_data.get(attrs['product_line'], {})
++        model_data = line_data.get(attrs['model'], {})
+
+         # Build storage key based on category (must match build_attribute_index logic)
+         # Watches: use mm + connectivity

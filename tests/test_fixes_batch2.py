@@ -4,8 +4,8 @@ Test script for Batch 2 fixes:
 - Fix #5: Smart storage extraction
 - Fix #7: MATCHED vs MULTIPLE_MATCHES status consistency
 """
-import sys
-sys.path.insert(0, '.')
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from matcher import extract_category, extract_storage, MATCH_STATUS_MATCHED, MATCH_STATUS_MULTIPLE
 

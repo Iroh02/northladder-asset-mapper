@@ -20,9 +20,14 @@ Outputs:
     - match_diagnostic_report_ALL.xlsx           (one tab per sheet)
 """
 
-import sys
+import sys, os
 import time
-sys.path.insert(0, '.')
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.join(_SCRIPT_DIR, '..')
+sys.path.insert(0, os.path.join(_PROJECT_ROOT, 'src'))
+DATA_DIR = os.path.join(_PROJECT_ROOT, 'data')
+OUTPUT_DIR = os.path.join(_PROJECT_ROOT, 'outputs')
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 import pandas as pd
 from rapidfuzz import fuzz, process
@@ -40,7 +45,9 @@ from matcher import (
 )
 
 
-def load_nl_catalog(excel_path="Asset Mapping Lists.xlsx"):
+def load_nl_catalog(excel_path=None):
+    if excel_path is None:
+        excel_path = os.path.join(DATA_DIR, "Asset Mapping Lists.xlsx")
     """Load and prepare the NL catalog with all indexes."""
     print("Loading NL catalog...")
     nl_df = parse_nl_sheet(excel_path)
@@ -62,7 +69,7 @@ def load_all_sheets():
 
     # Asset Mapping Lists.xlsx (List 1, List 2)
     print("\nLoading Asset Mapping Lists.xlsx...")
-    parsed = parse_asset_sheets("Asset Mapping Lists.xlsx")
+    parsed = parse_asset_sheets(os.path.join(DATA_DIR, "Asset Mapping Lists.xlsx"))
     for name, config in parsed.items():
         print(f"  Sheet '{name}': {len(config['df'])} rows, brand='{config['brand_col']}', name='{config['name_col']}'")
         sheets[name] = config
@@ -70,7 +77,7 @@ def load_all_sheets():
     # Auction List.xlsx
     print("\nLoading Auction List.xlsx...")
     try:
-        parsed_auction = parse_asset_sheets("Auction List.xlsx")
+        parsed_auction = parse_asset_sheets(os.path.join(DATA_DIR, "Auction List.xlsx"))
         for name, config in parsed_auction.items():
             print(f"  Sheet '{name}': {len(config['df'])} rows, brand='{config['brand_col']}', name='{config['name_col']}'")
             sheets[name] = config
@@ -340,19 +347,19 @@ def main():
     ).drop(columns=['_status_order']).reset_index(drop=True)
 
     # Write combined CSV
-    combined_csv = "match_diagnostic_report_ALL.csv"
+    combined_csv = os.path.join(OUTPUT_DIR, "match_diagnostic_report_ALL.csv")
     all_df.to_csv(combined_csv, index=False, encoding='utf-8-sig')
     print(f"\nWrote {combined_csv} ({len(all_df)} rows)")
 
     # Write per-sheet CSVs
     for sheet_name, rows in per_sheet_rows.items():
         safe_name = sheet_name.replace(' ', '_').replace('/', '_')
-        csv_path = f"match_diagnostic_report__{safe_name}.csv"
+        csv_path = os.path.join(OUTPUT_DIR, f"match_diagnostic_report__{safe_name}.csv")
         pd.DataFrame(rows).to_csv(csv_path, index=False, encoding='utf-8-sig')
         print(f"Wrote {csv_path} ({len(rows)} rows)")
 
     # Write combined Excel with one tab per sheet
-    xlsx_path = "match_diagnostic_report_ALL.xlsx"
+    xlsx_path = os.path.join(OUTPUT_DIR, "match_diagnostic_report_ALL.xlsx")
     with pd.ExcelWriter(xlsx_path, engine='openpyxl') as writer:
         # Combined sheet first
         all_df.to_excel(writer, sheet_name='ALL_Combined', index=False)

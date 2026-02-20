@@ -1,0 +1,195 @@
+--- a/matcher.py	(original)
++++ b/matcher.py	(fixed - add watch mm filtering + unconditional verification)
+
+###############################################################################
+# PART 1: Enhanced Watch Series Extraction (Fixes 48.7% "model=watch" problem)
+###############################################################################
+
+@@ -412,17 +412,58 @@ def extract_product_attributes(text: str, brand: str = '') -> Dict[str, str]:
+     # === WATCH DETECTION (priority - critical attributes: mm, series, connectivity) ===
+     if extract_category(text_norm) == 'watch':
+         watch_mm = extract_watch_mm(text_norm)
+
+-        # Extract series/generation: "series 10", "ultra 2", "se"
++        # Extract series/generation: Enhanced to handle ALL major brands
++        # OLD: Only recognized Apple patterns (series \d+, ultra \d+, se)
++        # NEW: Recognizes Apple, Samsung, Huawei, Garmin, and generic patterns
+         series = ''
+-        series_match = re.search(r'\b(series\s*\d+|ultra\s*\d+|se)\b', text_norm)
+-        if series_match:
+-            series = series_match.group(1).replace('  ', ' ').strip()
++
++        # Apple Watch patterns (existing)
++        if 'apple' in brand_norm or 'apple' in text_norm:
++            apple_match = re.search(r'\b(series\s*\d+|ultra\s*\d+|se)\b', text_norm)
++            if apple_match:
++                series = apple_match.group(1).replace('  ', ' ').strip()
++
++        # Samsung Galaxy Watch patterns (NEW)
++        elif 'samsung' in brand_norm or 'galaxy watch' in text_norm:
++            # "Galaxy Watch 6", "Galaxy Watch 6 Classic", "Galaxy Watch Active 2"
++            samsung_match = re.search(r'watch\s+(\d+|active\s*\d*|classic)', text_norm)
++            if samsung_match:
++                model_part = samsung_match.group(1).strip()
++                # Normalize: "6 classic" → "6classic", "active 2" → "active2"
++                series = model_part.replace(' ', '')
++
++        # Huawei Watch patterns (NEW)
++        elif 'huawei' in brand_norm or 'huawei' in text_norm:
++            # "Huawei Watch GT 2", "Huawei Watch GT 3", "Huawei Watch Fit"
++            huawei_match = re.search(r'watch\s+(gt\s*\d*|fit|ultimate)', text_norm)
++            if huawei_match:
++                model_part = huawei_match.group(1).strip()
++                series = model_part.replace(' ', '')  # "gt 2" → "gt2"
++
++        # Garmin patterns (NEW)
++        elif 'garmin' in brand_norm or 'garmin' in text_norm:
++            # "Garmin Venu 2", "Garmin Fenix 7", "Garmin Vivoactive 4"
++            garmin_match = re.search(r'(venu|fenix|vivoactive|forerunner)\s*\d*', text_norm)
++            if garmin_match:
++                series = garmin_match.group(0).replace(' ', '')  # "venu 2" → "venu2"
++
++        # Generic watch pattern (NEW - fallback for other brands)
++        if not series:
++            # Try to extract model number/name after "watch"
++            # e.g., "Watch 6", "Watch GT", "Watch Pro"
++            generic_match = re.search(r'watch\s+([a-z]*\d+[a-z]*|[a-z]+)', text_norm)
++            if generic_match:
++                series = generic_match.group(1).strip()
++            else:
++                # Last resort: just "watch" (still creates collisions, but better than nothing)
++                series = 'watch'
+
+         # Extract connectivity: GPS vs Cellular
+         connectivity = ''
+-        if 'cellular' in text_norm or 'lte' in text_norm.lower() or '4g' in text_norm.lower():
++        # Note: 4g/lte removed by normalize_text, so check original text if available
++        text_orig = text.lower() if text else text_norm
++        if 'cellular' in text_norm or 'lte' in text_orig or '4g' in text_orig:
+             connectivity = 'cellular'
+         elif 'gps' in text_norm:
+             connectivity = 'gps'
+
+         return {
+@@ -435,6 +476,10 @@ def extract_product_attributes(text: str, brand: str = '') -> Dict[str, str]:
+             'connectivity': connectivity,  # GPS vs Cellular
+         }
+
++    # CRITICAL: If watch mm detected but category isn't 'watch', still treat as watch
++    # This handles the 29.6% of watches missing "watch" keyword
++    if extract_watch_mm(text_norm) and not series:
++        # Re-run watch extraction even if category detection failed
++        return extract_product_attributes(text, brand)  # Recursive call with watch hint
+
+###############################################################################
+# PART 2: Watch MM Filtering in Auto-Select (Fixes 40-50% wrong auto-selections)
+###############################################################################
+
+@@ -1249,6 +1294,40 @@ def auto_select_matching_variant(
+             variants = nl_catalog[nl_catalog['uae_assetid'].isin(filtered)]
+
++    # === PRIORITY 1.75: WATCH MM FILTERING (CRITICAL!) ===
++    # NEW: After model variant filtering, enforce watch mm matching
++    # This prevents 42mm → 46mm false auto-selections
++    # Affects 34/39 watch groups with multiple mm sizes
++
++    # Detect if these are watch variants (check if any variant has mm)
++    has_mm_variants = any(
++        extract_watch_mm(str(name)) != ''
++        for name in variants['uae_assetname']
++    )
++
++    if has_mm_variants:
++        user_mm = extract_watch_mm(user_input)
++
++        if user_mm:
++            # User specified mm size → filter to EXACT mm only
++            filtered = []
++            for _, row in variants.iterrows():
++                nl_mm = extract_watch_mm(row['uae_assetname'])
++                if nl_mm == user_mm:  # Exact mm match required!
++                    filtered.append(row['uae_assetid'])
++
++            if len(filtered) > 0:
++                variants = nl_catalog[nl_catalog['uae_assetid'].isin(filtered)]
++
++            # If filtering narrowed down to 1 option, return it with mm reason
++            if len(variants) == 1:
++                selected = variants.iloc[0]['uae_assetid']
++                alternatives = [aid for aid in asset_ids if aid != selected]
++                return {
++                    'selected_id': selected,
++                    'auto_selected': True,
++                    'reason': f'Matched {user_mm}',
++                    'alternatives': alternatives
++                }
++        # else: User did NOT specify mm, but variants differ by mm
++        #       → Falls through to connectivity/first-pick logic
++        #       → Alternatives will show user all mm options for manual selection
+
+     # If model variant filtering narrowed down to 1 option, select it!
+     if len(variants) == 1:
+
+###############################################################################
+# PART 3: Unconditional Watch MM Verification (Fixes 29.6% category detection failures)
+###############################################################################
+
+@@ -1352,14 +1431,21 @@ def verify_critical_attributes(query: str, matched: str) -> bool:
+     query_storage = extract_storage(query)
+     matched_storage = extract_storage(matched)
+
+-    # WATCH-SPECIFIC RULE: Case size (mm) must match exactly
+-    # 42mm vs 46mm are DIFFERENT products!
+-    if extract_category(query) == 'watch':
+-        query_mm = extract_watch_mm(query)
+-        matched_mm = extract_watch_mm(matched)
+-        if query_mm and matched_mm and query_mm != matched_mm:
+-            return False  # Different case size -> different product
++    # WATCH MM RULE: Case size must match exactly regardless of category detection
++    # CRITICAL FIX: Don't rely on category extraction (which fails for 29.6% of watches)
++    # If EITHER query or matched contains mm, they're likely watches
++    # This catches: "Series 10 42mm GPS" (missing "watch" keyword) vs "Apple Watch Series 10 46mm"
++    query_mm = extract_watch_mm(query)
++    matched_mm = extract_watch_mm(matched)
++
++    if query_mm and matched_mm and query_mm != matched_mm:
++        # Different case sizes = DIFFERENT products (42mm ≠ 46mm)
++        # This rule applies REGARDLESS of category detection result
++        # Prevents false positives when query missing "watch" keyword
++        return False
+
++    # If only one has mm but not the other, it might be OK (e.g., query lacks detail)
++    # So we don't reject, let other rules decide
++
+     # RULE 1: Storage must match exactly if both have storage specified
+     # (128GB vs 256GB are different SKUs)
+     if query_storage and matched_storage:
+
+###############################################################################
+# PART 4: Watch MM Extraction - Add More Robust Pattern Matching
+###############################################################################
+
+@@ -902,12 +988,19 @@ def extract_watch_mm(text: str) -> str:
+     """
+     Extract watch case size in mm.
+
+-    Returns: '40mm', '42mm', '44mm', '46mm', '49mm', etc.
+-    Handles: "40mm", "40 mm", "40MM"
++    Returns: '38mm', '40mm', '41mm', '42mm', '44mm', '45mm', '46mm', '49mm', etc.
++    Handles: "40mm", "40 mm", "40MM", "40-mm"
+
+     Critical for distinguishing watch variants - 42mm vs 46mm are different products!
+     """
+     if not text:
+         return ''
+-    # Match 38-55mm range (covers all Apple Watch, Galaxy Watch, etc.)
+-    match = re.search(r'\b(3[89]|4[0-9]|5[0-5])\s*mm\b', text, re.IGNORECASE)
++
++    # Match 38-55mm range (covers all Apple Watch, Galaxy Watch, Garmin, Huawei, etc.)
++    # Enhanced pattern: handles spaces, hyphens, and various formats
++    match = re.search(
++        r'(?:^|\s|-)([3-5][0-9])\s*[-]?\s*mm(?:\b|$)',
++        text,
++        re.IGNORECASE
++    )
+     return f"{match.group(1)}mm" if match else ''

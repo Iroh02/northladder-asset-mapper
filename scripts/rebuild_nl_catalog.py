@@ -1,4 +1,6 @@
 """Rebuild NL catalog with current normalization (including years!)"""
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import pandas as pd
 from matcher import normalize_text
 import json
