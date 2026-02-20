@@ -1,4 +1,4 @@
-# 🔗 NL AssetLink
+# 🔗 NL AssetMapper
 
 **Intelligent product matching engine** for electronics recommerce platform
 

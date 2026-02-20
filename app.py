@@ -1,5 +1,5 @@
 """
-NL AssetLink - Streamlit Cloud Entry Point
+NL AssetMapper - Streamlit Cloud Entry Point
 
 This is a thin wrapper for Streamlit Cloud deployment.
 The actual app code is in src/app.py for better project organization.

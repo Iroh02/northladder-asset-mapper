@@ -1,5 +1,5 @@
 """
-NL AssetLink — Streamlit UI
+NL AssetMapper — Streamlit UI
 
 The NL master catalog is bundled with the app (nl_reference/).
 Users only need to upload their asset list Excel files.
@@ -44,13 +44,13 @@ from matcher import (
 # Page config
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="NL AssetLink",
+    page_title="NL AssetMapper",
     page_icon="🔗",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("🔗 NL AssetLink")
+st.title("🔗 NL AssetMapper")
 st.markdown("**Intelligent fuzzy matching with attribute verification and hybrid indexing**")
 
 # ---------------------------------------------------------------------------
@@ -466,7 +466,7 @@ with tab1:
     # Hardened Matching Explanation
     st.subheader("🔄 How the Matching Engine Works")
     st.markdown("""
-    NL AssetLink uses a **hardened multi-stage matching pipeline** to ensure accurate results
+    NL AssetMapper uses a **hardened multi-stage matching pipeline** to ensure accurate results
     while preventing false positives:
     """)
 
@@ -1531,6 +1531,6 @@ with tab5:
 # ---------------------------------------------------------------------------
 st.divider()
 st.caption(
-    "NL AssetLink v1.0 — "
+    "NL AssetMapper v1.0 — "
     "Hybrid matching with rapidfuzz. NL catalog pre-loaded."
 )
