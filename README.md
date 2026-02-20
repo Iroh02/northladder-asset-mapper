@@ -1,4 +1,4 @@
-# 🔗 NorthLadder UAE Asset ID Mapper
+# 🔗 NL AssetLink
 
 **Intelligent product matching engine** for electronics recommerce platform
 
