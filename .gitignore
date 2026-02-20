@@ -3,14 +3,15 @@ venv/
 __pycache__/
 *.pyc
 
-# Streamlit
-.streamlit/
+# Streamlit (exclude secrets but keep config)
+.streamlit/secrets.toml
+.streamlit/credentials.toml
 
 # Outputs (generated results, reports, CSVs)
 outputs/
 
-# NL reference cache (regenerated at runtime)
-src/nl_reference/
+# NL reference cache (included for Streamlit Cloud deployment)
+# src/nl_reference/  # Commented out - needed for deployment
 
 # OS artifacts
 nul
