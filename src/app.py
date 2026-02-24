@@ -11,6 +11,8 @@ Version: FULLY FIXED + NL catalog rebuilt with years (Feb 2026)
 """
 
 import io
+import json
+import os
 import streamlit as st
 import pandas as pd
 
@@ -38,7 +40,161 @@ from matcher import (
     CONFIDENCE_HIGH,
     CONFIDENCE_MEDIUM,
     CONFIDENCE_LOW,
+    generate_catalog_add_requests_v2,
+    generate_diagnostics_sheet_v2,
+    generate_safety_audit_v2,
+    generate_schema_audit_v2,
+    extract_model_family_key,
+    normalize_text,
+    normalize_brand,
 )
+
+def _parse_alternatives(raw):
+    """Safely parse alternatives from JSON string, Python str repr, or raw list."""
+    if isinstance(raw, list):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return []
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return []
+
+
+# ---------------------------------------------------------------------------
+# MMS enrichment: UAE → MMS mapping
+# ---------------------------------------------------------------------------
+
+_MMS_FILE_NAME = 'EU X MMS X UAE Asset list Mapping.xlsx'
+
+@st.cache_data(show_spinner="Loading MMS mapping...")
+def load_mms_mapping():
+    """
+    Load the UAE → MMS mapping from the catalogue mapping file.
+
+    Returns a dict:  uae_id (str, stripped) → {
+        'mms_asset_id': str or '',
+        'mms_asset_label': str or '',
+        'status': 'FOUND' | 'AMBIGUOUS',
+        'candidates_json': str (JSON array) — only for AMBIGUOUS
+    }
+    If file not found, returns empty dict.
+    """
+    # Search in common locations relative to app.py
+    search_dirs = [
+        os.path.dirname(__file__),                       # src/
+        os.path.join(os.path.dirname(__file__), '..'),   # project root
+        os.path.join(os.path.dirname(__file__), '..', 'data'),
+    ]
+    fpath = None
+    for d in search_dirs:
+        candidate = os.path.join(d, _MMS_FILE_NAME)
+        if os.path.isfile(candidate):
+            fpath = candidate
+            break
+    if fpath is None:
+        return {}
+
+    df = pd.read_excel(fpath, sheet_name='Catalogue Mapping',
+                        usecols=['UAE Asset Id', 'MMS AssetId', 'MMS Asset Label'])
+    # Normalize join keys
+    df['UAE Asset Id'] = df['UAE Asset Id'].astype(str).str.strip()
+    df['MMS AssetId'] = df['MMS AssetId'].astype(str).str.strip()
+    df['MMS Asset Label'] = df['MMS Asset Label'].astype(str).str.strip()
+
+    # Drop exact full-row duplicates (safe), keep first
+    df = df.drop_duplicates()
+
+    # Build lookup, detecting ambiguity (1 UAE → many distinct MMS IDs)
+    mapping = {}
+    for uae_id, grp in df.groupby('UAE Asset Id'):
+        distinct_mms = grp['MMS AssetId'].unique()
+        if len(distinct_mms) == 1:
+            row = grp.iloc[0]
+            mapping[uae_id] = {
+                'mms_asset_id': row['MMS AssetId'],
+                'mms_asset_label': row['MMS Asset Label'],
+                'status': 'FOUND',
+                'candidates_json': '',
+            }
+        else:
+            # Ambiguous: multiple distinct MMS IDs for same UAE ID
+            cands = [{'mms_asset_id': r['MMS AssetId'], 'mms_asset_label': r['MMS Asset Label']}
+                     for _, r in grp.iterrows()]
+            mapping[uae_id] = {
+                'mms_asset_id': '',
+                'mms_asset_label': '',
+                'status': 'AMBIGUOUS',
+                'candidates_json': json.dumps(cands),
+            }
+    return mapping
+
+
+def _mms_lookup_single(uae_id, mms_map):
+    """Look up a single UAE Asset ID in the MMS map.
+    Returns (mms_asset_id, mms_asset_label, status)."""
+    uid = str(uae_id).strip() if pd.notna(uae_id) else ''
+    if not uid:
+        return '', '', ''
+    entry = mms_map.get(uid)
+    if entry is None:
+        return '', '', 'NOT_FOUND'
+    return entry['mms_asset_id'], entry['mms_asset_label'], entry['status']
+
+
+def _enrich_df_with_mms(df, mms_map, primary_output='UAE'):
+    """
+    Enrich a DataFrame that has mapped_uae_assetid with MMS columns.
+
+    Adds: mms_asset_id, mms_asset_label, mms_lookup_status,
+          primary_output_id, primary_output_catalog.
+    Also enriches alt_N_id and blk_N_id columns if present.
+    Returns a new DataFrame (does not modify in place).
+    """
+    if 'mapped_uae_assetid' not in df.columns or not mms_map:
+        return df
+    df = df.copy()
+
+    # Core enrichment on mapped_uae_assetid
+    mms_ids, mms_labels, mms_statuses = [], [], []
+    for uid in df['mapped_uae_assetid']:
+        mid, mlbl, mst = _mms_lookup_single(uid, mms_map)
+        mms_ids.append(mid)
+        mms_labels.append(mlbl)
+        mms_statuses.append(mst)
+
+    # Insert MMS columns right after mapped_uae_assetid
+    insert_at = list(df.columns).index('mapped_uae_assetid') + 1
+    # Insert in reverse order so positions stay correct
+    df.insert(insert_at, 'mms_lookup_status', mms_statuses)
+    df.insert(insert_at, 'mms_asset_label', mms_labels)
+    df.insert(insert_at, 'mms_asset_id', mms_ids)
+
+    # Primary output columns
+    if primary_output == 'MMS':
+        df['primary_output_id'] = df['mms_asset_id']
+        df['primary_output_catalog'] = 'MMS'
+    else:
+        df['primary_output_id'] = df['mapped_uae_assetid']
+        df['primary_output_catalog'] = 'UAE'
+
+    # Enrich alt_N_id and blk_N_id columns if present
+    for prefix in ('alt', 'blk'):
+        for i in range(1, 4):
+            id_col = f'{prefix}_{i}_id'
+            if id_col in df.columns:
+                mms_col_id = f'{prefix}_{i}_mms_id'
+                mms_col_lbl = f'{prefix}_{i}_mms_label'
+                c_ids, c_lbls = [], []
+                for uid in df[id_col]:
+                    mid, mlbl, _ = _mms_lookup_single(uid, mms_map)
+                    c_ids.append(mid)
+                    c_lbls.append(mlbl)
+                df[mms_col_id] = c_ids
+                df[mms_col_lbl] = c_lbls
+
+    return df
+
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -102,6 +258,161 @@ st.sidebar.markdown("**Confidence Tiers:**")
 st.sidebar.markdown("🟢 **HIGH (≥90%)** — MATCHED status (auto-selected if multiple variants)")
 st.sidebar.markdown("🟡 **MEDIUM (85-89%)** — REVIEW REQUIRED (attributes differ)")
 st.sidebar.markdown("🔴 **LOW (<85%)** — NO_MATCH (no confident match found)")
+
+st.sidebar.divider()
+
+# Engine: default to v2, no user toggle
+selected_engine = "v2"
+
+st.sidebar.divider()
+
+# Primary Output ID toggle (UAE vs MMS)
+mms_map = load_mms_mapping()
+if mms_map:
+    primary_output_choice = st.sidebar.radio(
+        "Primary Output ID",
+        options=["UAE", "MMS"],
+        index=0,
+        help="UAE: primary_output_id = mapped_uae_assetid. MMS: primary_output_id = MMS AssetId (when found).",
+    )
+    _ambiguous_count = sum(1 for v in mms_map.values() if v['status'] == 'AMBIGUOUS')
+    st.sidebar.caption(f"MMS mapping loaded: {len(mms_map):,} UAE IDs")
+    if _ambiguous_count > 0:
+        st.sidebar.warning(f"{_ambiguous_count} UAE IDs map to multiple MMS IDs (marked AMBIGUOUS)")
+else:
+    primary_output_choice = "UAE"
+    st.sidebar.caption(f"MMS mapping file not found ({_MMS_FILE_NAME})")
+
+st.sidebar.divider()
+
+# Export View toggle (Analyst View vs Debug View)
+export_view = st.sidebar.radio(
+    "Export View",
+    options=["Analyst View", "Debug View"],
+    index=0,
+    help="Analyst View: clean columns for analysts. Debug View: all columns for debugging.",
+)
+_analyst_view = (export_view == "Analyst View")
+
+# MMS Mode Display toggle (only visible when MMS is selected)
+if primary_output_choice == 'MMS':
+    _mms_display = st.sidebar.radio(
+        "MMS Mode Display",
+        options=["MMS-first (recommended)", "NL-first (legacy)"],
+        index=0,
+        help="MMS-first: MMS fields shown first for analysts. NL-first: NL product name shown first.",
+    )
+    _mms_first = (_mms_display == "MMS-first (recommended)")
+else:
+    _mms_first = False
+
+# Analyst View: keep ALL original input cols + clean output cols only.
+# These are columns ADDED by the matcher / enrichment (not from user's Excel).
+_MATCHER_ADDED_COLS = {
+    'original_input', 'mapped_uae_assetid', 'match_score', 'match_status',
+    'confidence', 'matched_on', 'method', 'auto_selected', 'selection_reason',
+    'alternatives', 'category', 'verification_pass', 'verification_reasons',
+    'review_reason', 'no_match_reason', 'review_priority', 'review_summary',
+    'blocked_candidates', 'nl_product_name',
+    'mms_asset_id', 'mms_asset_label', 'mms_lookup_status',
+    'mms_resolution_hint',
+    'primary_output_id', 'primary_output_catalog',
+    'query_category', 'matched_category', 'query_storage', 'matched_storage',
+    'query_model_tokens', 'matched_model_tokens',
+    'top1_name', 'top1_score', 'top2_name', 'top2_score', 'top3_name', 'top3_score',
+}
+
+# --- Analyst View output column specs ---
+# UAE mode (no MMS columns)
+_ANALYST_MATCHED_OUTPUT = [
+    'original_input', 'nl_product_name',
+    'match_status', 'match_score', 'confidence',
+    'mapped_uae_assetid',
+    'alternatives',
+]
+# MMS-first mode: MMS fields shown before NL
+_ANALYST_MATCHED_MMS_FIRST = [
+    'mms_asset_id', 'mms_asset_label', 'mms_lookup_status',
+    'mms_resolution_hint',
+    'primary_output_catalog', 'primary_output_id',
+    'mapped_uae_assetid', 'nl_product_name',
+    'match_status', 'match_score', 'confidence',
+    'alternatives',
+]
+# MMS NL-first (legacy): NL shown before MMS
+_ANALYST_MATCHED_MMS_LEGACY = [
+    'original_input', 'nl_product_name',
+    'match_status', 'match_score', 'confidence',
+    'mapped_uae_assetid',
+    'mms_asset_id', 'mms_asset_label', 'mms_lookup_status',
+    'mms_resolution_hint',
+    'primary_output_catalog', 'primary_output_id',
+    'alternatives',
+]
+
+# Unmatched: UAE mode
+_ANALYST_UNMATCHED_OUTPUT = [
+    'original_input',
+    'match_status', 'no_match_reason', 'review_summary',
+    'mapped_uae_assetid',
+    'primary_output_id', 'primary_output_catalog',
+]
+# Unmatched: MMS mode
+_ANALYST_UNMATCHED_MMS = [
+    'match_status', 'no_match_reason', 'review_summary',
+    'mapped_uae_assetid',
+    'mms_lookup_status', 'mms_resolution_hint',
+    'primary_output_catalog', 'primary_output_id',
+]
+
+# Resolution hints for non-FOUND MMS statuses
+_MMS_HINT_MAP = {
+    'NOT_FOUND': 'UAE id not present in MMS mapping file (request mapping add)',
+    'AMBIGUOUS': 'Multiple MMS ids for this UAE id (needs resolution)',
+}
+
+
+def _add_mms_resolution_hint(df):
+    """Add mms_resolution_hint column based on mms_lookup_status."""
+    if 'mms_lookup_status' not in df.columns:
+        return df
+    df = df.copy()
+    df['mms_resolution_hint'] = df['mms_lookup_status'].map(
+        lambda s: _MMS_HINT_MAP.get(str(s).strip(), '') if pd.notna(s) else ''
+    )
+    return df
+
+
+def _apply_analyst_cols(df, output_cols):
+    """Keep all original input columns + specified output columns.
+
+    - Original columns = everything NOT added by the matcher/enrichment.
+    - Deduplicates Category/category (drops lowercase matcher one).
+    """
+    # Detect original input columns (preserve order from user's Excel)
+    original_cols = [c for c in df.columns if c not in _MATCHER_ADDED_COLS]
+    # Dedup: if 'Category' (original) exists, skip 'category' (matcher)
+    if 'Category' in original_cols:
+        output_cols = [c for c in output_cols if c != 'category']
+    # Build final: originals + output cols (only those present)
+    append_cols = [c for c in output_cols if c in df.columns]
+    final = original_cols + append_cols
+    return df[final]
+
+
+def _get_matched_analyst_cols():
+    """Return the right Matched column spec based on current mode."""
+    if primary_output_choice == 'MMS':
+        return _ANALYST_MATCHED_MMS_FIRST if _mms_first else _ANALYST_MATCHED_MMS_LEGACY
+    return _ANALYST_MATCHED_OUTPUT
+
+
+def _get_unmatched_analyst_cols():
+    """Return the right Unmatched column spec based on current mode."""
+    if primary_output_choice == 'MMS':
+        return _ANALYST_UNMATCHED_MMS
+    return _ANALYST_UNMATCHED_OUTPUT
+
 
 st.sidebar.divider()
 
@@ -672,15 +983,24 @@ with tab2:
         if st.button("🚀 Run Asset Mapping", type="primary", use_container_width=True):
 
             all_results = {}
+            all_results_v2 = {}  # Only populated in compare mode
 
-            for sheet_name, info in detected_sheets.items():
-                st.subheader(f"🔍 Matching: {sheet_name}")
+            engines_to_run = ["v1", "v2"] if selected_engine == "compare" else [selected_engine]
+
+            for run_engine in engines_to_run:
+              engine_label = f"[{run_engine.upper()}] " if selected_engine == "compare" else ""
+              for sheet_name, info in detected_sheets.items():
+                st.subheader(f"🔍 {engine_label}Matching: {sheet_name}")
                 progress = st.progress(0, text=f"Starting {sheet_name}...")
 
                 def make_progress_cb(prog_bar, sname):
                     def cb(current, total):
                         prog_bar.progress(current / total, text=f"{sname}... {current:,}/{total:,}")
                     return cb
+
+                # Task B: conservative widening for List 1 sheets (avoid review spam)
+                _is_list1 = sheet_name.lower().startswith('list 1')
+                _widen = 'conservative' if (_is_list1 and run_engine == 'v2') else 'aggressive'
 
                 df_result = run_matching(
                     df_input=info['df'],
@@ -694,8 +1014,10 @@ with tab2:
                     attribute_index=nl_attribute_index,
                     nl_catalog=df_nl_clean,
                     signature_index=nl_signature_index,
+                    engine=run_engine,
+                    widen_mode=_widen,
                 )
-                progress.progress(1.0, text=f"✅ {sheet_name} complete!")
+                progress.progress(1.0, text=f"✅ {engine_label}{sheet_name} complete!")
 
                 # Data hygiene: Normalize device types to canonical categories
                 if 'category' in df_result.columns:
@@ -705,6 +1027,11 @@ with tab2:
                 for col in ('alternatives', 'selection_reason'):
                     if col in df_result.columns:
                         df_result[col] = df_result[col].astype(str)
+
+                if run_engine == "v2" and selected_engine == "compare":
+                    all_results_v2[sheet_name] = df_result
+                    continue  # Don't overwrite v1 results
+
                 all_results[sheet_name] = df_result
 
                 matched = (df_result['match_status'] == MATCH_STATUS_MATCHED).sum()
@@ -760,6 +1087,53 @@ with tab2:
                             )
 
             # ------------------------------------------------------------------
+            # Compare mode: show v1 vs v2 diff summary
+            # ------------------------------------------------------------------
+            if selected_engine == "compare" and all_results_v2:
+                st.subheader("V1 vs V2 Comparison")
+                for sheet_name in all_results:
+                    if sheet_name not in all_results_v2:
+                        continue
+                    v1_df = all_results[sheet_name]
+                    v2_df = all_results_v2[sheet_name]
+                    col1, col2 = st.columns(2)
+                    for label, df, col in [("Stable (v1)", v1_df, col1), ("Experimental (v2)", v2_df, col2)]:
+                        with col:
+                            st.markdown(f"**{label} — {sheet_name}**")
+                            _t = len(df)
+                            _m = int((df['match_status'] == MATCH_STATUS_MATCHED).sum())
+                            _r = int((df['match_status'] == MATCH_STATUS_SUGGESTED).sum())
+                            _n = int((df['match_status'] == MATCH_STATUS_NO_MATCH).sum())
+                            st.metric("Matched", _m, f"{_m/_t*100:.1f}%")
+                            st.metric("Review", _r, f"{_r/_t*100:.1f}%")
+                            st.metric("No Match", _n, f"{_n/_t*100:.1f}%")
+
+                    # Show rows that changed status between v1 and v2
+                    if len(v1_df) == len(v2_df):
+                        changed = v1_df['match_status'] != v2_df['match_status']
+                        n_changed = changed.sum()
+                        if n_changed > 0:
+                            st.info(f"{n_changed} rows changed status between v1 and v2 in {sheet_name}")
+                            with st.expander(f"View {n_changed} changed rows"):
+                                diff_df = v1_df[changed][['original_input', 'match_status', 'matched_on']].copy()
+                                diff_df.columns = ['Product', 'v1_status', 'v1_matched_on']
+                                diff_df['v2_status'] = v2_df[changed]['match_status'].values
+                                diff_df['v2_matched_on'] = v2_df[changed]['matched_on'].values
+                                st.dataframe(diff_df, use_container_width=True, hide_index=True)
+
+            # ------------------------------------------------------------------
+            # MMS enrichment: add MMS columns to all result DataFrames
+            # ------------------------------------------------------------------
+            if mms_map:
+                for sn in list(all_results.keys()):
+                    all_results[sn] = _enrich_df_with_mms(
+                        all_results[sn], mms_map, primary_output_choice)
+                if selected_engine == "compare" and all_results_v2:
+                    for sn in list(all_results_v2.keys()):
+                        all_results_v2[sn] = _enrich_df_with_mms(
+                            all_results_v2[sn], mms_map, primary_output_choice)
+
+            # ------------------------------------------------------------------
             # Store results in session state for cross-tab access
             # ------------------------------------------------------------------
             st.session_state['mapping_results'] = {
@@ -790,7 +1164,8 @@ with tab2:
 
                         suffix = ' - Matched'
                         safe_name = sheet_name[:31 - len(suffix)] + suffix
-                        matched.to_excel(writer, sheet_name=safe_name, index=False)
+                        out_matched = _apply_analyst_cols(_add_mms_resolution_hint(matched), _get_matched_analyst_cols()) if _analyst_view else matched
+                        out_matched.to_excel(writer, sheet_name=safe_name, index=False)
 
                 # 2. UNMATCHED sheets (one per uploaded sheet) - Only NO_MATCH items
                 for sheet_name, df_result in all_results.items():
@@ -798,7 +1173,8 @@ with tab2:
                     if len(unmatched) > 0:
                         suffix = ' - Unmatched'
                         safe_name = sheet_name[:31 - len(suffix)] + suffix
-                        unmatched.to_excel(writer, sheet_name=safe_name, index=False)
+                        out_unmatched = _apply_analyst_cols(_add_mms_resolution_hint(unmatched), _get_unmatched_analyst_cols()) if _analyst_view else unmatched
+                        out_unmatched.to_excel(writer, sheet_name=safe_name, index=False)
 
                 # 3. REVIEW REQUIRED sheet - All REVIEW_REQUIRED items (combined)
                 # Uses curated columns to avoid NaN when sheets have different input column names
@@ -821,15 +1197,73 @@ with tab2:
 
                 if all_review_required:
                     df_review_combined = pd.concat(all_review_required, ignore_index=True)
+
+                    # Parse standardized alternatives into alt_1/2/3 columns
+                    for i in range(1, 4):
+                        df_review_combined[f'alt_{i}_id'] = ''
+                        df_review_combined[f'alt_{i}_name'] = ''
+                        df_review_combined[f'alt_{i}_score'] = ''
+                        df_review_combined[f'alt_{i}_reason'] = ''
+                    for idx, row in df_review_combined.iterrows():
+                        alts = _parse_alternatives(row.get('alternatives', ''))
+                        for j, alt in enumerate(alts[:3], 1):
+                            if isinstance(alt, dict):
+                                df_review_combined.at[idx, f'alt_{j}_id'] = alt.get('uae_assetid', '')
+                                df_review_combined.at[idx, f'alt_{j}_name'] = alt.get('uae_assetname', '')
+                                df_review_combined.at[idx, f'alt_{j}_score'] = alt.get('score', '')
+                                df_review_combined.at[idx, f'alt_{j}_reason'] = alt.get('reason', '')
+
+                    # Parse blocked_candidates into blk_1/2/3 columns (Task A)
+                    for i in range(1, 4):
+                        df_review_combined[f'blk_{i}_id'] = ''
+                        df_review_combined[f'blk_{i}_name'] = ''
+                        df_review_combined[f'blk_{i}_score'] = ''
+                        df_review_combined[f'blk_{i}_reason'] = ''
+                    for idx, row in df_review_combined.iterrows():
+                        blk = _parse_alternatives(row.get('blocked_candidates', ''))
+                        for j, b in enumerate(blk[:3], 1):
+                            if isinstance(b, dict):
+                                df_review_combined.at[idx, f'blk_{j}_id'] = b.get('uae_assetid', '')
+                                df_review_combined.at[idx, f'blk_{j}_name'] = b.get('uae_assetname', '')
+                                df_review_combined.at[idx, f'blk_{j}_score'] = b.get('score', '')
+                                df_review_combined.at[idx, f'blk_{j}_reason'] = b.get('reason', '')
+
+                    # Sort by review_priority (highest first) if available
+                    if 'review_priority' in df_review_combined.columns:
+                        df_review_combined = df_review_combined.sort_values('review_priority', ascending=False)
+
                     # Build curated column set: canonical fields present in ALL sheets
                     review_cols = [
                         'Source Sheet', 'original_input', 'category',
+                        'review_priority', 'review_summary',
                         'mapped_uae_assetid', 'nl_product_name',
                         'match_score', 'match_status', 'confidence',
                         'matched_on', 'method',
-                        'auto_selected', 'selection_reason', 'alternatives',
+                        'auto_selected', 'selection_reason',
+                        'review_reason', 'no_match_reason',
+                        'alt_1_id', 'alt_1_name', 'alt_1_score', 'alt_1_reason',
+                        'alt_2_id', 'alt_2_name', 'alt_2_score', 'alt_2_reason',
+                        'alt_3_id', 'alt_3_name', 'alt_3_score', 'alt_3_reason',
+                        'blk_1_id', 'blk_1_name', 'blk_1_score', 'blk_1_reason',
+                        'blk_2_id', 'blk_2_name', 'blk_2_score', 'blk_2_reason',
+                        'blk_3_id', 'blk_3_name', 'blk_3_score', 'blk_3_reason',
                         'verification_pass', 'verification_reasons',
                     ]
+                    # Add MMS columns only when MMS mode is active
+                    if primary_output_choice == 'MMS':
+                        # Insert MMS cols after mapped_uae_assetid
+                        _mms_insert = review_cols.index('mapped_uae_assetid') + 1
+                        for _mc in reversed(['mms_asset_id', 'mms_asset_label', 'mms_lookup_status',
+                                             'primary_output_id', 'primary_output_catalog']):
+                            review_cols.insert(_mms_insert, _mc)
+                        # Add MMS cols for alt/blk
+                        for _p in ('alt', 'blk'):
+                            for _i in range(1, 4):
+                                _after = f'{_p}_{_i}_name'
+                                if _after in review_cols:
+                                    _pos = review_cols.index(_after) + 1
+                                    for _mc in reversed([f'{_p}_{_i}_mms_id', f'{_p}_{_i}_mms_label']):
+                                        review_cols.insert(_pos, _mc)
                     # Only include columns that actually exist
                     review_cols = [c for c in review_cols if c in df_review_combined.columns]
                     df_review_combined[review_cols].to_excel(writer, sheet_name='Review Required', index=False)
@@ -842,22 +1276,27 @@ with tab2:
                         # Get original product name from the canonical field
                         original_name = str(row.get('original_input', ''))
 
-                        # Parse alternatives
-                        alternatives_raw = row.get('alternatives', '')
-                        if isinstance(alternatives_raw, str) and alternatives_raw:
-                            try:
-                                alternatives = eval(alternatives_raw) if alternatives_raw.startswith('[') else []
-                            except:
-                                alternatives = []
-                        else:
-                            alternatives = []
+                        # Parse alternatives (JSON-safe)
+                        alternatives = _parse_alternatives(row.get('alternatives', ''))
+                        # Extract IDs from dicts (v2) or use raw strings (v1)
+                        alt_ids = []
+                        for a in alternatives:
+                            if isinstance(a, dict):
+                                aid = a.get('uae_assetid', '')
+                                if aid:
+                                    alt_ids.append(aid)
+                            elif isinstance(a, str):
+                                alt_ids.append(a)
 
                         # Get selected product details from NL catalog
                         selected_id = row['mapped_uae_assetid']
                         nl_entry = df_nl_clean[df_nl_clean['uae_assetid'] == selected_id]
                         selected_name = nl_entry.iloc[0]['uae_assetname'] if len(nl_entry) > 0 else 'N/A'
 
-                        auto_selected_details.append({
+                        # MMS enrichment for auto-selected
+                        _mid, _mlbl, _mst = _mms_lookup_single(selected_id, mms_map)
+
+                        detail = {
                             'Source Sheet': sheet_name,
                             'Your Product': original_name,
                             'Matched To': row['matched_on'],
@@ -865,9 +1304,15 @@ with tab2:
                             'Selected ID': selected_id,
                             'Selected Product': selected_name,
                             'Selection Reason': row.get('selection_reason', 'N/A'),
-                            'Alternative IDs': ', '.join(alternatives) if alternatives else 'None',
-                            'Total Variants': len(alternatives) + 1,
-                        })
+                            'Alternative IDs': ', '.join(alt_ids) if alt_ids else 'None',
+                            'Total Variants': len(alt_ids) + 1,
+                        }
+                        if mms_map:
+                            detail['mms_asset_id'] = _mid
+                            detail['mms_asset_label'] = _mlbl
+                            detail['mms_lookup_status'] = _mst
+                            detail['primary_output_id'] = _mid if primary_output_choice == 'MMS' else selected_id
+                        auto_selected_details.append(detail)
 
                 if auto_selected_details:
                     df_auto_selected = pd.DataFrame(auto_selected_details)
@@ -918,7 +1363,325 @@ with tab2:
                     'Match Rate': f"{total_matched/total_items*100:.1f}%",
                 })
 
-                pd.DataFrame(summary_rows).to_excel(writer, sheet_name='Summary', index=False)
+                df_summary = pd.DataFrame(summary_rows)
+                # Add MMS note row
+                _mms_note = (
+                    "Note: mms_lookup_status NOT_FOUND means UAE asset id not present "
+                    "in MMS mapping reference file (not a matcher failure)."
+                )
+                df_summary = pd.concat([
+                    df_summary,
+                    pd.DataFrame([{'Sheet': '', **{c: '' for c in df_summary.columns if c != 'Sheet'}}]),
+                    pd.DataFrame([{'Sheet': _mms_note, **{c: '' for c in df_summary.columns if c != 'Sheet'}}]),
+                ], ignore_index=True)
+                df_summary.to_excel(writer, sheet_name='Summary', index=False)
+
+                # ---- V2-only sheets: Catalog Add Requests + Diagnostics ----
+                if selected_engine in ("v2", "compare"):
+                    _v2_src = all_results_v2 if selected_engine == "compare" else all_results
+                    if generate_catalog_add_requests_v2 is not None:
+                        try:
+                            df_cat_reqs = generate_catalog_add_requests_v2(_v2_src)
+                            if df_cat_reqs is not None and len(df_cat_reqs) > 0:
+                                df_cat_reqs.to_excel(writer, sheet_name='Catalog Add Requests', index=False)
+                        except Exception:
+                            pass  # Don't break output on v2 helper failure
+                    if generate_diagnostics_sheet_v2 is not None:
+                        try:
+                            df_diag = generate_diagnostics_sheet_v2(_v2_src)
+                            if df_diag is not None and len(df_diag) > 0:
+                                df_diag.to_excel(writer, sheet_name='Diagnostics', index=False)
+                        except Exception:
+                            pass
+                    # Task E: Safety + Schema audit sheets (Debug View only)
+                    if not _analyst_view:
+                        if generate_safety_audit_v2 is not None:
+                            try:
+                                df_safety = generate_safety_audit_v2(_v2_src)
+                                if df_safety is not None and len(df_safety) > 0:
+                                    df_safety.to_excel(writer, sheet_name='V2 Safety Audit', index=False)
+                            except Exception:
+                                pass
+                        if generate_schema_audit_v2 is not None:
+                            try:
+                                df_schema = generate_schema_audit_v2(_v2_src)
+                                if df_schema is not None and len(df_schema) > 0:
+                                    df_schema.to_excel(writer, sheet_name='V2 Schema Audit', index=False)
+                            except Exception:
+                                pass
+
+                    # ---- Analyst-facing action sheets (v2 only, Debug View) ----
+                    if not _analyst_view:
+                        try:
+                            _v2_combined = pd.concat(_v2_src.values(), ignore_index=True)
+                            _v2_review = _v2_combined[_v2_combined['match_status'] == MATCH_STATUS_SUGGESTED].copy()
+
+                            # Parse alt/blk scores for priority sorting
+                            _v2_review['_alt1_score'] = 0.0
+                            _v2_review['_blk1_score'] = 0.0
+                            _v2_review['_alt1_id'] = ''
+                            _v2_review['_alt1_name'] = ''
+                            _v2_review['_blk1_id'] = ''
+                            _v2_review['_blk1_name'] = ''
+                            for idx, row in _v2_review.iterrows():
+                                alts = _parse_alternatives(row.get('alternatives', ''))
+                                if alts and isinstance(alts[0], dict):
+                                    _v2_review.at[idx, '_alt1_score'] = float(alts[0].get('score', 0) or 0)
+                                    _v2_review.at[idx, '_alt1_id'] = alts[0].get('uae_assetid', '')
+                                    _v2_review.at[idx, '_alt1_name'] = alts[0].get('uae_assetname', '')
+                                blk = _parse_alternatives(row.get('blocked_candidates', ''))
+                                if blk and isinstance(blk[0], dict):
+                                    _v2_review.at[idx, '_blk1_score'] = float(blk[0].get('score', 0) or 0)
+                                    _v2_review.at[idx, '_blk1_id'] = blk[0].get('uae_assetid', '')
+                                    _v2_review.at[idx, '_blk1_name'] = blk[0].get('uae_assetname', '')
+
+                            _v2_review['_best_score'] = _v2_review[['_alt1_score', '_blk1_score']].max(axis=1)
+
+                            # Best candidate id/name for quick display
+                            _v2_review['suggested_id'] = ''
+                            _v2_review['suggested_name'] = ''
+                            for idx, row in _v2_review.iterrows():
+                                if row['_alt1_score'] >= row['_blk1_score'] and row['_alt1_id']:
+                                    _v2_review.at[idx, 'suggested_id'] = row['_alt1_id']
+                                    _v2_review.at[idx, 'suggested_name'] = row['_alt1_name']
+                                elif row['_blk1_id']:
+                                    _v2_review.at[idx, 'suggested_id'] = row['_blk1_id']
+                                    _v2_review.at[idx, 'suggested_name'] = row['_blk1_name']
+
+                            # A) Quick Review: high-score candidates (>=90)
+                            quick_mask = _v2_review['_best_score'] >= 90
+                            df_quick = _v2_review[quick_mask].sort_values('review_priority', ascending=False) if 'review_priority' in _v2_review.columns else _v2_review[quick_mask].sort_values('_best_score', ascending=False)
+                            if len(df_quick) > 0:
+                                quick_cols = ['original_input', 'category', 'suggested_id', 'suggested_name',
+                                              '_best_score', 'review_summary', 'review_reason', 'method']
+                                quick_cols = [c for c in quick_cols if c in df_quick.columns]
+                                df_quick_out = df_quick[quick_cols].copy()
+                                df_quick_out = df_quick_out.rename(columns={'_best_score': 'best_candidate_score'})
+                                df_quick_out['action'] = 'Verify ID and approve, or reject'
+                                df_quick_out.to_excel(writer, sheet_name='Quick Review', index=False)
+
+                            # B) Deep Review: remaining review rows (score < 90)
+                            deep_mask = ~quick_mask
+                            df_deep = _v2_review[deep_mask].sort_values('review_priority', ascending=False) if 'review_priority' in _v2_review.columns else _v2_review[deep_mask].sort_values('_best_score', ascending=False)
+                            if len(df_deep) > 0:
+                                # Parse top 3 candidate names+scores for analyst
+                                for i in range(1, 4):
+                                    df_deep[f'cand_{i}_name'] = ''
+                                    df_deep[f'cand_{i}_score'] = ''
+                                for idx, row in df_deep.iterrows():
+                                    # Merge alt + blk, sort by score, take top 3
+                                    all_cands = []
+                                    for src in ('alternatives', 'blocked_candidates'):
+                                        parsed = _parse_alternatives(row.get(src, ''))
+                                        for c in parsed:
+                                            if isinstance(c, dict) and c.get('uae_assetname'):
+                                                all_cands.append(c)
+                                    all_cands.sort(key=lambda x: float(x.get('score', 0) or 0), reverse=True)
+                                    for j, c in enumerate(all_cands[:3], 1):
+                                        df_deep.at[idx, f'cand_{j}_name'] = c.get('uae_assetname', '')
+                                        df_deep.at[idx, f'cand_{j}_score'] = c.get('score', '')
+                                deep_cols = ['original_input', 'category',
+                                             'cand_1_name', 'cand_1_score',
+                                             'cand_2_name', 'cand_2_score',
+                                             'cand_3_name', 'cand_3_score',
+                                             'review_summary', 'review_reason', 'method']
+                                deep_cols = [c for c in deep_cols if c in df_deep.columns]
+                                df_deep[deep_cols].to_excel(writer, sheet_name='Deep Review', index=False)
+
+                            # C) Catalog Missing Likely
+                            _v2_nomatch = _v2_combined[_v2_combined['no_match_reason'] == 'CATALOG_MISSING_LIKELY'].copy()
+                            if len(_v2_nomatch) > 0:
+                                _v2_nomatch['_brand'] = ''
+                                _v2_nomatch['_group_key'] = ''
+                                for idx, row in _v2_nomatch.iterrows():
+                                    name = str(row.get('original_input', ''))
+                                    brand = ''
+                                    for bcol in ('Brand', 'brand', 'manufacturer'):
+                                        if bcol in row.index and pd.notna(row.get(bcol)):
+                                            brand = str(row[bcol]).strip()
+                                            break
+                                    _v2_nomatch.at[idx, '_brand'] = brand
+                                    cat = str(row.get('category', ''))
+                                    try:
+                                        mfk = extract_model_family_key(name, cat, brand_hint=brand)
+                                    except Exception:
+                                        mfk = ''
+                                    if not mfk:
+                                        nb = normalize_brand(brand) or brand.lower()
+                                        ct = normalize_text(name)
+                                        ft = ' '.join(ct.split()[:3]) if ct else ''
+                                        mfk = f'{nb}:{ft}' if ft else nb
+                                    _v2_nomatch.at[idx, '_group_key'] = mfk
+
+                                # Aggregate by group_key
+                                cat_rows = []
+                                for gk, grp in _v2_nomatch.groupby('_group_key'):
+                                    examples = grp['original_input'].unique()[:3].tolist()
+                                    cat_rows.append({
+                                        'group_key': gk,
+                                        'brand': grp['_brand'].mode().iloc[0] if len(grp['_brand'].mode()) > 0 else '',
+                                        'category': grp['category'].mode().iloc[0] if len(grp['category'].mode()) > 0 else '',
+                                        'count': len(grp),
+                                        'example_1': examples[0] if len(examples) > 0 else '',
+                                        'example_2': examples[1] if len(examples) > 1 else '',
+                                        'example_3': examples[2] if len(examples) > 2 else '',
+                                        'action': 'Add to NL catalog',
+                                    })
+                                if cat_rows:
+                                    df_cat_missing = pd.DataFrame(cat_rows).sort_values('count', ascending=False)
+                                    df_cat_missing.to_excel(writer, sheet_name='Catalog Missing Likely', index=False)
+                        except Exception:
+                            pass  # Don't break export on analyst sheet failure
+
+                # ---- Compare mode: add V2 Summary sheet ----
+                if selected_engine == "compare" and all_results_v2:
+                    v2_summary = []
+                    for sn, df_r in all_results_v2.items():
+                        _t = len(df_r)
+                        v2_summary.append({
+                            'Sheet': sn,
+                            'Total Items': _t,
+                            'Matched': int((df_r['match_status'] == MATCH_STATUS_MATCHED).sum()),
+                            'Review Required': int((df_r['match_status'] == MATCH_STATUS_SUGGESTED).sum()),
+                            'No Match': int((df_r['match_status'] == MATCH_STATUS_NO_MATCH).sum()),
+                            'Match Rate': f"{(df_r['match_status'] == MATCH_STATUS_MATCHED).sum()/_t*100:.1f}%",
+                        })
+                    df_v2_summ = pd.DataFrame(v2_summary)
+                    df_v2_summ = pd.concat([
+                        df_v2_summ,
+                        pd.DataFrame([{'Sheet': '', **{c: '' for c in df_v2_summ.columns if c != 'Sheet'}}]),
+                        pd.DataFrame([{'Sheet': _mms_note, **{c: '' for c in df_v2_summ.columns if c != 'Sheet'}}]),
+                    ], ignore_index=True)
+                    df_v2_summ.to_excel(writer, sheet_name='Summary (V2)', index=False)
+
+                    # ---- FIX 3: Compare mode — full V2 Matched/Unmatched/Review/Auto-Selected ----
+                    # Matched (V2) — per sheet
+                    for sheet_name, df_v2 in all_results_v2.items():
+                        matched_v2 = df_v2[df_v2['match_status'] == MATCH_STATUS_MATCHED].copy()
+                        if len(matched_v2) > 0:
+                            nl_names_v2 = []
+                            for _, r in matched_v2.iterrows():
+                                aid = r['mapped_uae_assetid']
+                                nle = df_nl_clean[df_nl_clean['uae_assetid'] == aid]
+                                nl_names_v2.append(nle.iloc[0]['uae_assetname'] if len(nle) > 0 else 'N/A')
+                            insert_pos = list(matched_v2.columns).index('mapped_uae_assetid') + 1
+                            matched_v2.insert(insert_pos, 'nl_product_name', nl_names_v2)
+                            suffix = ' - Matched (V2)'
+                            safe_name = sheet_name[:31 - len(suffix)] + suffix
+                            out_mv2 = _apply_analyst_cols(_add_mms_resolution_hint(matched_v2), _get_matched_analyst_cols()) if _analyst_view else matched_v2
+                            out_mv2.to_excel(writer, sheet_name=safe_name, index=False)
+
+                    # Unmatched (V2) — per sheet
+                    for sheet_name, df_v2 in all_results_v2.items():
+                        unmatched_v2 = df_v2[df_v2['match_status'] == MATCH_STATUS_NO_MATCH]
+                        if len(unmatched_v2) > 0:
+                            suffix = ' - Unmatched (V2)'
+                            safe_name = sheet_name[:31 - len(suffix)] + suffix
+                            out_uv2 = _apply_analyst_cols(_add_mms_resolution_hint(unmatched_v2), _get_unmatched_analyst_cols()) if _analyst_view else unmatched_v2
+                            out_uv2.to_excel(writer, sheet_name=safe_name, index=False)
+
+                    # Review Required (V2) — combined, with alt columns
+                    all_review_v2 = []
+                    for sheet_name, df_v2 in all_results_v2.items():
+                        rev = df_v2[df_v2['match_status'] == MATCH_STATUS_SUGGESTED].copy()
+                        if len(rev) > 0:
+                            nl_names_v2 = []
+                            for _, r in rev.iterrows():
+                                aid = r['mapped_uae_assetid']
+                                nle = df_nl_clean[df_nl_clean['uae_assetid'] == aid]
+                                nl_names_v2.append(nle.iloc[0]['uae_assetname'] if len(nle) > 0 else 'N/A')
+                            rev['nl_product_name'] = nl_names_v2
+                            rev.insert(0, 'Source Sheet', sheet_name)
+                            all_review_v2.append(rev)
+                    if all_review_v2:
+                        df_rev_v2 = pd.concat(all_review_v2, ignore_index=True)
+                        for i in range(1, 4):
+                            df_rev_v2[f'alt_{i}_id'] = ''
+                            df_rev_v2[f'alt_{i}_name'] = ''
+                            df_rev_v2[f'alt_{i}_score'] = ''
+                            df_rev_v2[f'alt_{i}_reason'] = ''
+                        for idx, row in df_rev_v2.iterrows():
+                            alts = _parse_alternatives(row.get('alternatives', ''))
+                            for j, alt in enumerate(alts[:3], 1):
+                                if isinstance(alt, dict):
+                                    df_rev_v2.at[idx, f'alt_{j}_id'] = alt.get('uae_assetid', '')
+                                    df_rev_v2.at[idx, f'alt_{j}_name'] = alt.get('uae_assetname', '')
+                                    df_rev_v2.at[idx, f'alt_{j}_score'] = alt.get('score', '')
+                                    df_rev_v2.at[idx, f'alt_{j}_reason'] = alt.get('reason', '')
+                        # Blocked candidates (Task A)
+                        for i in range(1, 4):
+                            df_rev_v2[f'blk_{i}_id'] = ''
+                            df_rev_v2[f'blk_{i}_name'] = ''
+                            df_rev_v2[f'blk_{i}_score'] = ''
+                            df_rev_v2[f'blk_{i}_reason'] = ''
+                        for idx, row in df_rev_v2.iterrows():
+                            blk = _parse_alternatives(row.get('blocked_candidates', ''))
+                            for j, b in enumerate(blk[:3], 1):
+                                if isinstance(b, dict):
+                                    df_rev_v2.at[idx, f'blk_{j}_id'] = b.get('uae_assetid', '')
+                                    df_rev_v2.at[idx, f'blk_{j}_name'] = b.get('uae_assetname', '')
+                                    df_rev_v2.at[idx, f'blk_{j}_score'] = b.get('score', '')
+                                    df_rev_v2.at[idx, f'blk_{j}_reason'] = b.get('reason', '')
+                        rev_cols_v2 = [
+                            'Source Sheet', 'original_input', 'category',
+                            'mapped_uae_assetid', 'nl_product_name',
+                            'match_score', 'match_status', 'confidence',
+                            'matched_on', 'method',
+                            'auto_selected', 'selection_reason',
+                            'review_reason', 'no_match_reason',
+                            'alt_1_id', 'alt_1_name', 'alt_1_score', 'alt_1_reason',
+                            'alt_2_id', 'alt_2_name', 'alt_2_score', 'alt_2_reason',
+                            'alt_3_id', 'alt_3_name', 'alt_3_score', 'alt_3_reason',
+                            'blk_1_id', 'blk_1_name', 'blk_1_score', 'blk_1_reason',
+                            'blk_2_id', 'blk_2_name', 'blk_2_score', 'blk_2_reason',
+                            'blk_3_id', 'blk_3_name', 'blk_3_score', 'blk_3_reason',
+                            'verification_pass', 'verification_reasons',
+                        ]
+                        if primary_output_choice == 'MMS':
+                            _ins = rev_cols_v2.index('mapped_uae_assetid') + 1
+                            for _mc in reversed(['mms_asset_id', 'mms_asset_label', 'mms_lookup_status',
+                                                 'primary_output_id', 'primary_output_catalog']):
+                                rev_cols_v2.insert(_ins, _mc)
+                            for _p in ('alt', 'blk'):
+                                for _i in range(1, 4):
+                                    _af = f'{_p}_{_i}_name'
+                                    if _af in rev_cols_v2:
+                                        _ps = rev_cols_v2.index(_af) + 1
+                                        for _mc in reversed([f'{_p}_{_i}_mms_id', f'{_p}_{_i}_mms_label']):
+                                            rev_cols_v2.insert(_ps, _mc)
+                        rev_cols_v2 = [c for c in rev_cols_v2 if c in df_rev_v2.columns]
+                        df_rev_v2[rev_cols_v2].to_excel(writer, sheet_name='Review Required (V2)', index=False)
+
+                    # Auto-Selected Products (V2)
+                    auto_v2_details = []
+                    for sheet_name, df_v2 in all_results_v2.items():
+                        auto_v2 = df_v2[df_v2['auto_selected'] == True].copy()
+                        for _, r in auto_v2.iterrows():
+                            alternatives = _parse_alternatives(r.get('alternatives', ''))
+                            a_ids = [a.get('uae_assetid', '') for a in alternatives if isinstance(a, dict) and a.get('uae_assetid')]
+                            sel_id = r['mapped_uae_assetid']
+                            nle = df_nl_clean[df_nl_clean['uae_assetid'] == sel_id]
+                            sel_name = nle.iloc[0]['uae_assetname'] if len(nle) > 0 else 'N/A'
+                            _mid, _mlbl, _mst = _mms_lookup_single(sel_id, mms_map)
+                            detail_v2 = {
+                                'Source Sheet': sheet_name,
+                                'Your Product': str(r.get('original_input', '')),
+                                'Matched To': r['matched_on'],
+                                'Match Score': f"{r['match_score']:.1f}%",
+                                'Selected ID': sel_id,
+                                'Selected Product': sel_name,
+                                'Selection Reason': r.get('selection_reason', 'N/A'),
+                                'Alternative IDs': ', '.join(a_ids) if a_ids else 'None',
+                                'Total Variants': len(a_ids) + 1,
+                            }
+                            if mms_map:
+                                detail_v2['mms_asset_id'] = _mid
+                                detail_v2['mms_asset_label'] = _mlbl
+                                detail_v2['mms_lookup_status'] = _mst
+                                detail_v2['primary_output_id'] = _mid if primary_output_choice == 'MMS' else sel_id
+                            auto_v2_details.append(detail_v2)
+                    if auto_v2_details:
+                        pd.DataFrame(auto_v2_details).to_excel(writer, sheet_name='Auto-Selected (V2)', index=False)
 
             output.seek(0)
 
@@ -1113,19 +1876,21 @@ if tab3 is not None:
                             st.markdown(f"**Match Score:** {row['match_score']:.1f}%")
                             st.markdown(f"**Selection Reason:** {row.get('selection_reason', 'N/A')}")
 
-                        # Parse alternatives
+                        # Parse alternatives (JSON-safe)
                         current_id = str(row['mapped_uae_assetid']).strip()
-                        alternatives_raw = row.get('alternatives', '')
-                        if isinstance(alternatives_raw, str) and alternatives_raw:
-                            try:
-                                alternatives = eval(alternatives_raw) if alternatives_raw.startswith('[') else []
-                            except:
-                                alternatives = []
-                        else:
-                            alternatives = []
+                        alternatives = _parse_alternatives(row.get('alternatives', ''))
+                        # Extract IDs from dicts (v2) or use raw strings (v1)
+                        alt_ids = []
+                        for a in alternatives:
+                            if isinstance(a, dict):
+                                aid = a.get('uae_assetid', '')
+                                if aid:
+                                    alt_ids.append(aid)
+                            elif isinstance(a, str):
+                                alt_ids.append(a)
 
                         # Build full list: current ID + alternatives
-                        all_ids = [current_id] + alternatives
+                        all_ids = [current_id] + alt_ids
 
                         # Show variant options
                         st.markdown(f"**{len(all_ids)} Variant Options:**")
@@ -1173,6 +1938,29 @@ if tab3 is not None:
                                     all_dataframes[sheet_name].at[idx, 'selection_reason'] = 'Manually overridden'
                                     override_count += 1
 
+                    # Re-enrich MMS columns for overridden rows
+                    if mms_map and override_count > 0:
+                        for key, sel_id in st.session_state.variant_selections.items():
+                            parts = key.rsplit('_', 1)
+                            if len(parts) != 2:
+                                continue
+                            sn, idx_s = parts
+                            ridx = int(idx_s)
+                            if sn not in all_dataframes:
+                                continue
+                            uid = str(sel_id).strip()
+                            mid, mlbl, mst = _mms_lookup_single(uid, mms_map)
+                            all_dataframes[sn].at[ridx, 'mms_asset_id'] = mid
+                            all_dataframes[sn].at[ridx, 'mms_asset_label'] = mlbl
+                            all_dataframes[sn].at[ridx, 'mms_lookup_status'] = mst
+                            if primary_output_choice == 'MMS':
+                                all_dataframes[sn].at[ridx, 'primary_output_id'] = mid
+                                all_dataframes[sn].at[ridx, 'primary_output_catalog'] = mlbl
+                            else:
+                                all_dataframes[sn].at[ridx, 'primary_output_id'] = uid
+                                nl_e = df_nl_clean[df_nl_clean['uae_assetid'] == uid]
+                                all_dataframes[sn].at[ridx, 'primary_output_catalog'] = nl_e.iloc[0]['uae_assetname'] if len(nl_e) > 0 else ''
+
                     # Update session state with modified data
                     st.session_state['mapping_results']['all_results'] = all_dataframes
 
@@ -1185,7 +1973,8 @@ if tab3 is not None:
                             if len(matched) > 0:
                                 suffix = ' - Matched'
                                 safe_name = sheet_name[:31 - len(suffix)] + suffix
-                                matched.to_excel(writer, sheet_name=safe_name, index=False)
+                                out_m = _apply_analyst_cols(_add_mms_resolution_hint(matched), _get_matched_analyst_cols()) if _analyst_view else matched
+                                out_m.to_excel(writer, sheet_name=safe_name, index=False)
 
                         # 2. UNMATCHED sheets
                         for sheet_name, df_result in all_dataframes.items():
@@ -1193,7 +1982,8 @@ if tab3 is not None:
                             if len(unmatched) > 0:
                                 suffix = ' - Unmatched'
                                 safe_name = sheet_name[:31 - len(suffix)] + suffix
-                                unmatched.to_excel(writer, sheet_name=safe_name, index=False)
+                                out_u = _apply_analyst_cols(_add_mms_resolution_hint(unmatched), _get_unmatched_analyst_cols()) if _analyst_view else unmatched
+                                out_u.to_excel(writer, sheet_name=safe_name, index=False)
 
                         # 3. REVIEW REQUIRED sheet (curated columns to avoid NaN across sheets)
                         all_review_required = []
@@ -1207,11 +1997,17 @@ if tab3 is not None:
                             df_review_combined = pd.concat(all_review_required, ignore_index=True)
                             review_cols = [
                                 'Source Sheet', 'original_input', 'category',
-                                'mapped_uae_assetid', 'match_score', 'match_status',
+                                'mapped_uae_assetid',
+                                'match_score', 'match_status',
                                 'confidence', 'matched_on', 'method',
                                 'auto_selected', 'selection_reason', 'alternatives',
                                 'verification_pass', 'verification_reasons',
                             ]
+                            if primary_output_choice == 'MMS':
+                                _ins = review_cols.index('mapped_uae_assetid') + 1
+                                for _mc in reversed(['mms_asset_id', 'mms_asset_label', 'mms_lookup_status',
+                                                     'primary_output_id', 'primary_output_catalog']):
+                                    review_cols.insert(_ins, _mc)
                             review_cols = [c for c in review_cols if c in df_review_combined.columns]
                             df_review_combined[review_cols].to_excel(writer, sheet_name='Review Required', index=False)
 
@@ -1222,20 +2018,22 @@ if tab3 is not None:
                             for idx, row in auto_selected.iterrows():
                                 original_name = str(row.get('original_input', ''))
 
-                                alternatives_raw = row.get('alternatives', '')
-                                if isinstance(alternatives_raw, str) and alternatives_raw:
-                                    try:
-                                        alternatives = eval(alternatives_raw) if alternatives_raw.startswith('[') else []
-                                    except:
-                                        alternatives = []
-                                else:
-                                    alternatives = []
+                                alternatives = _parse_alternatives(row.get('alternatives', ''))
+                                alt_ids = []
+                                for a in alternatives:
+                                    if isinstance(a, dict):
+                                        aid = a.get('uae_assetid', '')
+                                        if aid:
+                                            alt_ids.append(aid)
+                                    elif isinstance(a, str):
+                                        alt_ids.append(a)
 
                                 selected_id = row['mapped_uae_assetid']
                                 nl_entry = df_nl_clean[df_nl_clean['uae_assetid'] == selected_id]
                                 selected_name = nl_entry.iloc[0]['uae_assetname'] if len(nl_entry) > 0 else 'N/A'
 
-                                auto_selected_details.append({
+                                _mid, _mlbl, _mst = _mms_lookup_single(selected_id, mms_map)
+                                detail_ovr = {
                                     'Source Sheet': sheet_name,
                                     'Your Product': original_name,
                                     'Matched To': row['matched_on'],
@@ -1243,9 +2041,15 @@ if tab3 is not None:
                                     'Selected ID': selected_id,
                                     'Selected Product': selected_name,
                                     'Selection Reason': row.get('selection_reason', 'N/A'),
-                                    'Alternative IDs': ', '.join(alternatives) if alternatives else 'None',
-                                    'Total Variants': len(alternatives) + 1,
-                                })
+                                    'Alternative IDs': ', '.join(alt_ids) if alt_ids else 'None',
+                                    'Total Variants': len(alt_ids) + 1,
+                                }
+                                if mms_map:
+                                    detail_ovr['mms_asset_id'] = _mid
+                                    detail_ovr['mms_asset_label'] = _mlbl
+                                    detail_ovr['mms_lookup_status'] = _mst
+                                    detail_ovr['primary_output_id'] = _mid if primary_output_choice == 'MMS' else selected_id
+                                auto_selected_details.append(detail_ovr)
 
                         if auto_selected_details:
                             df_auto_selected = pd.DataFrame(auto_selected_details)
@@ -1296,7 +2100,13 @@ if tab3 is not None:
                             'Match Rate': f"{total_matched/total_items*100:.1f}%",
                         })
 
-                        pd.DataFrame(summary_rows).to_excel(writer, sheet_name='Summary', index=False)
+                        df_ovr_summ = pd.DataFrame(summary_rows)
+                        df_ovr_summ = pd.concat([
+                            df_ovr_summ,
+                            pd.DataFrame([{'Sheet': '', **{c: '' for c in df_ovr_summ.columns if c != 'Sheet'}}]),
+                            pd.DataFrame([{'Sheet': _mms_note, **{c: '' for c in df_ovr_summ.columns if c != 'Sheet'}}]),
+                        ], ignore_index=True)
+                        df_ovr_summ.to_excel(writer, sheet_name='Summary', index=False)
 
                     output.seek(0)
 
