@@ -55,10 +55,10 @@ def run_matching(
     nl_catalog=None,
     diagnostic=False,
     signature_index=None,
-    engine="v1",
+    engine="v2",
     widen_mode="aggressive",
 ):
-    """Route to v1 (Stable) or v2 (Experimental) matching engine."""
+    """Route to v1 (Stable) or v2 (Default) matching engine."""
     if engine == "v2":
         return _run_matching_v2(
             df_input, brand_col, name_col, nl_lookup, nl_names,
