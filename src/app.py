@@ -294,20 +294,11 @@ export_view = st.sidebar.radio(
 )
 _analyst_view = (export_view == "Analyst View")
 
-# MMS Mode Display toggle (only visible when MMS is selected)
-if primary_output_choice == 'MMS':
-    _mms_display = st.sidebar.radio(
-        "MMS Mode Display",
-        options=["MMS-first (recommended)", "NL-first (legacy)"],
-        index=0,
-        help="MMS-first: MMS fields shown first for analysts. NL-first: NL product name shown first.",
-    )
-    _mms_first = (_mms_display == "MMS-first (recommended)")
-else:
-    _mms_first = False
+# ---------------------------------------------------------------------------
+# Analyst View column definitions
+# ---------------------------------------------------------------------------
 
-# Analyst View: keep ALL original input cols + clean output cols only.
-# These are columns ADDED by the matcher / enrichment (not from user's Excel).
+# All columns ADDED by the matcher / enrichment (not from user's original Excel).
 _MATCHER_ADDED_COLS = {
     'original_input', 'mapped_uae_assetid', 'match_score', 'match_status',
     'confidence', 'matched_on', 'method', 'auto_selected', 'selection_reason',
@@ -315,72 +306,63 @@ _MATCHER_ADDED_COLS = {
     'review_reason', 'no_match_reason', 'review_priority', 'review_summary',
     'blocked_candidates', 'nl_product_name',
     'mms_asset_id', 'mms_asset_label', 'mms_lookup_status',
-    'mms_resolution_hint',
     'primary_output_id', 'primary_output_catalog',
     'query_category', 'matched_category', 'query_storage', 'matched_storage',
     'query_model_tokens', 'matched_model_tokens',
     'top1_name', 'top1_score', 'top2_name', 'top2_score', 'top3_name', 'top3_score',
+    # Parsed alt/blk columns (added in Review export)
+    'alt_1_id', 'alt_1_name', 'alt_1_score', 'alt_1_reason',
+    'alt_2_id', 'alt_2_name', 'alt_2_score', 'alt_2_reason',
+    'alt_3_id', 'alt_3_name', 'alt_3_score', 'alt_3_reason',
+    'blk_1_id', 'blk_1_name', 'blk_1_score', 'blk_1_reason',
+    'blk_2_id', 'blk_2_name', 'blk_2_score', 'blk_2_reason',
+    'blk_3_id', 'blk_3_name', 'blk_3_score', 'blk_3_reason',
+    'alt_1_mms_id', 'alt_1_mms_label', 'alt_2_mms_id', 'alt_2_mms_label',
+    'alt_3_mms_id', 'alt_3_mms_label',
+    'blk_1_mms_id', 'blk_1_mms_label', 'blk_2_mms_id', 'blk_2_mms_label',
+    'blk_3_mms_id', 'blk_3_mms_label',
 }
 
-# --- Analyst View output column specs ---
-# UAE mode (no MMS columns)
-_ANALYST_MATCHED_OUTPUT = [
-    'original_input', 'nl_product_name',
-    'match_status', 'match_score', 'confidence',
-    'mapped_uae_assetid',
-    'alternatives',
-]
-# MMS-first mode: MMS fields shown before NL
-_ANALYST_MATCHED_MMS_FIRST = [
+# Matched sheets: essential output columns appended after all original input cols.
+# MMS cols included "(if present)" — they exist when MMS mapping file is loaded.
+_ANALYST_MATCHED_COLS = [
     'mms_asset_id', 'mms_asset_label', 'mms_lookup_status',
-    'mms_resolution_hint',
-    'primary_output_catalog', 'primary_output_id',
     'mapped_uae_assetid', 'nl_product_name',
     'match_status', 'match_score', 'confidence',
     'alternatives',
 ]
-# MMS NL-first (legacy): NL shown before MMS
-_ANALYST_MATCHED_MMS_LEGACY = [
-    'original_input', 'nl_product_name',
-    'match_status', 'match_score', 'confidence',
-    'mapped_uae_assetid',
+
+# Review Required sheets: curated list (avoids NaN across different sheet schemas).
+_ANALYST_REVIEW_COLS = [
+    'Source Sheet', 'original_input', 'category',
+    'nl_product_name', 'mapped_uae_assetid',
+    'match_score', 'confidence',
     'mms_asset_id', 'mms_asset_label', 'mms_lookup_status',
-    'mms_resolution_hint',
-    'primary_output_catalog', 'primary_output_id',
-    'alternatives',
+    'alt_1_id', 'alt_1_name', 'alt_1_score',
+    'alt_2_id', 'alt_2_name', 'alt_2_score',
+    'alt_3_id', 'alt_3_name', 'alt_3_score',
+    'blk_1_id', 'blk_1_name', 'blk_1_score',
+    'blk_2_id', 'blk_2_name', 'blk_2_score',
+    'blk_3_id', 'blk_3_name', 'blk_3_score',
+    'review_summary',
 ]
 
-# Unmatched: UAE mode
-_ANALYST_UNMATCHED_OUTPUT = [
-    'original_input',
-    'match_status', 'no_match_reason', 'review_summary',
-    'mapped_uae_assetid',
-    'primary_output_id', 'primary_output_catalog',
-]
-# Unmatched: MMS mode
-_ANALYST_UNMATCHED_MMS = [
-    'match_status', 'no_match_reason', 'review_summary',
-    'mapped_uae_assetid',
-    'mms_lookup_status', 'mms_resolution_hint',
-    'primary_output_catalog', 'primary_output_id',
-]
 
-# Resolution hints for non-FOUND MMS statuses
-_MMS_HINT_MAP = {
-    'NOT_FOUND': 'UAE id not present in MMS mapping file (request mapping add)',
-    'AMBIGUOUS': 'Multiple MMS ids for this UAE id (needs resolution)',
+# MMS columns hidden in Analyst View when Primary Output == UAE
+_MMS_ANALYST_HIDE = {
+    'mms_asset_id', 'mms_asset_label', 'mms_lookup_status', 'mms_candidates_json',
+    'alt_1_mms_id', 'alt_1_mms_label', 'alt_2_mms_id', 'alt_2_mms_label',
+    'alt_3_mms_id', 'alt_3_mms_label',
+    'blk_1_mms_id', 'blk_1_mms_label', 'blk_2_mms_id', 'blk_2_mms_label',
+    'blk_3_mms_id', 'blk_3_mms_label',
 }
 
 
-def _add_mms_resolution_hint(df):
-    """Add mms_resolution_hint column based on mms_lookup_status."""
-    if 'mms_lookup_status' not in df.columns:
-        return df
-    df = df.copy()
-    df['mms_resolution_hint'] = df['mms_lookup_status'].map(
-        lambda s: _MMS_HINT_MAP.get(str(s).strip(), '') if pd.notna(s) else ''
-    )
-    return df
+def _strip_mms_if_uae(cols):
+    """Remove MMS columns from a list when Primary Output == UAE."""
+    if primary_output_choice == 'MMS':
+        return cols
+    return [c for c in cols if c not in _MMS_ANALYST_HIDE]
 
 
 def _apply_analyst_cols(df, output_cols):
@@ -388,30 +370,50 @@ def _apply_analyst_cols(df, output_cols):
 
     - Original columns = everything NOT added by the matcher/enrichment.
     - Deduplicates Category/category (drops lowercase matcher one).
+    - Hides MMS columns when Primary Output == UAE.
     """
-    # Detect original input columns (preserve order from user's Excel)
     original_cols = [c for c in df.columns if c not in _MATCHER_ADDED_COLS]
-    # Dedup: if 'Category' (original) exists, skip 'category' (matcher)
     if 'Category' in original_cols:
         output_cols = [c for c in output_cols if c != 'category']
-    # Build final: originals + output cols (only those present)
+    output_cols = _strip_mms_if_uae(output_cols)
     append_cols = [c for c in output_cols if c in df.columns]
     final = original_cols + append_cols
     return df[final]
 
 
-def _get_matched_analyst_cols():
-    """Return the right Matched column spec based on current mode."""
-    if primary_output_choice == 'MMS':
-        return _ANALYST_MATCHED_MMS_FIRST if _mms_first else _ANALYST_MATCHED_MMS_LEGACY
-    return _ANALYST_MATCHED_OUTPUT
+def _apply_analyst_review(df):
+    """Apply Analyst View filtering to Review Required sheets."""
+    cols = _strip_mms_if_uae([c for c in _ANALYST_REVIEW_COLS if c in df.columns])
+    return df[cols]
 
 
-def _get_unmatched_analyst_cols():
-    """Return the right Unmatched column spec based on current mode."""
-    if primary_output_choice == 'MMS':
-        return _ANALYST_UNMATCHED_MMS
-    return _ANALYST_UNMATCHED_OUTPUT
+def _prepare_analyst_unmatched(df, df_nl_clean):
+    """Prepare Unmatched sheet for Analyst View.
+
+    - UAE mode: add nl_product_name (looked up from NL catalog), drop MMS cols.
+    - MMS mode: keep MMS cols (mms_asset_label already enriched), no nl_product_name.
+    """
+    df = df.copy()
+    if primary_output_choice != 'MMS':
+        # UAE mode: add nl_product_name for validation, drop MMS cols
+        if 'mapped_uae_assetid' in df.columns:
+            nl_names = []
+            for uid in df['mapped_uae_assetid']:
+                uid_s = str(uid).strip() if pd.notna(uid) else ''
+                if uid_s:
+                    nl_entry = df_nl_clean[df_nl_clean['uae_assetid'] == uid_s]
+                    nl_names.append(nl_entry.iloc[0]['uae_assetname'] if len(nl_entry) > 0 else '')
+                else:
+                    nl_names.append('')
+            insert_pos = list(df.columns).index('mapped_uae_assetid') + 1
+            df.insert(insert_pos, 'nl_product_name', nl_names)
+        _drop_mms = ['mms_asset_id', 'mms_asset_label', 'mms_lookup_status']
+        df = df.drop(columns=[c for c in _drop_mms if c in df.columns], errors='ignore')
+    else:
+        # MMS mode: drop nl_product_name if present (shouldn't be, but safe)
+        if 'nl_product_name' in df.columns:
+            df = df.drop(columns=['nl_product_name'])
+    return df
 
 
 st.sidebar.divider()
@@ -1164,7 +1166,7 @@ with tab2:
 
                         suffix = ' - Matched'
                         safe_name = sheet_name[:31 - len(suffix)] + suffix
-                        out_matched = _apply_analyst_cols(_add_mms_resolution_hint(matched), _get_matched_analyst_cols()) if _analyst_view else matched
+                        out_matched = _apply_analyst_cols(matched, _ANALYST_MATCHED_COLS) if _analyst_view else matched
                         out_matched.to_excel(writer, sheet_name=safe_name, index=False)
 
                 # 2. UNMATCHED sheets (one per uploaded sheet) - Only NO_MATCH items
@@ -1173,7 +1175,7 @@ with tab2:
                     if len(unmatched) > 0:
                         suffix = ' - Unmatched'
                         safe_name = sheet_name[:31 - len(suffix)] + suffix
-                        out_unmatched = _apply_analyst_cols(_add_mms_resolution_hint(unmatched), _get_unmatched_analyst_cols()) if _analyst_view else unmatched
+                        out_unmatched = _prepare_analyst_unmatched(unmatched, df_nl_clean) if _analyst_view else unmatched
                         out_unmatched.to_excel(writer, sheet_name=safe_name, index=False)
 
                 # 3. REVIEW REQUIRED sheet - All REVIEW_REQUIRED items (combined)
@@ -1232,41 +1234,42 @@ with tab2:
                     if 'review_priority' in df_review_combined.columns:
                         df_review_combined = df_review_combined.sort_values('review_priority', ascending=False)
 
-                    # Build curated column set: canonical fields present in ALL sheets
-                    review_cols = [
-                        'Source Sheet', 'original_input', 'category',
-                        'review_priority', 'review_summary',
-                        'mapped_uae_assetid', 'nl_product_name',
-                        'match_score', 'match_status', 'confidence',
-                        'matched_on', 'method',
-                        'auto_selected', 'selection_reason',
-                        'review_reason', 'no_match_reason',
-                        'alt_1_id', 'alt_1_name', 'alt_1_score', 'alt_1_reason',
-                        'alt_2_id', 'alt_2_name', 'alt_2_score', 'alt_2_reason',
-                        'alt_3_id', 'alt_3_name', 'alt_3_score', 'alt_3_reason',
-                        'blk_1_id', 'blk_1_name', 'blk_1_score', 'blk_1_reason',
-                        'blk_2_id', 'blk_2_name', 'blk_2_score', 'blk_2_reason',
-                        'blk_3_id', 'blk_3_name', 'blk_3_score', 'blk_3_reason',
-                        'verification_pass', 'verification_reasons',
-                    ]
-                    # Add MMS columns only when MMS mode is active
-                    if primary_output_choice == 'MMS':
-                        # Insert MMS cols after mapped_uae_assetid
-                        _mms_insert = review_cols.index('mapped_uae_assetid') + 1
-                        for _mc in reversed(['mms_asset_id', 'mms_asset_label', 'mms_lookup_status',
-                                             'primary_output_id', 'primary_output_catalog']):
-                            review_cols.insert(_mms_insert, _mc)
-                        # Add MMS cols for alt/blk
-                        for _p in ('alt', 'blk'):
-                            for _i in range(1, 4):
-                                _after = f'{_p}_{_i}_name'
-                                if _after in review_cols:
-                                    _pos = review_cols.index(_after) + 1
-                                    for _mc in reversed([f'{_p}_{_i}_mms_id', f'{_p}_{_i}_mms_label']):
-                                        review_cols.insert(_pos, _mc)
-                    # Only include columns that actually exist
-                    review_cols = [c for c in review_cols if c in df_review_combined.columns]
-                    df_review_combined[review_cols].to_excel(writer, sheet_name='Review Required', index=False)
+                    if _analyst_view:
+                        _apply_analyst_review(df_review_combined).to_excel(
+                            writer, sheet_name='Review Required', index=False)
+                    else:
+                        # Debug View: full curated column set
+                        review_cols = [
+                            'Source Sheet', 'original_input', 'category',
+                            'review_priority', 'review_summary',
+                            'mapped_uae_assetid', 'nl_product_name',
+                            'match_score', 'match_status', 'confidence',
+                            'matched_on', 'method',
+                            'auto_selected', 'selection_reason',
+                            'review_reason', 'no_match_reason',
+                            'alt_1_id', 'alt_1_name', 'alt_1_score', 'alt_1_reason',
+                            'alt_2_id', 'alt_2_name', 'alt_2_score', 'alt_2_reason',
+                            'alt_3_id', 'alt_3_name', 'alt_3_score', 'alt_3_reason',
+                            'blk_1_id', 'blk_1_name', 'blk_1_score', 'blk_1_reason',
+                            'blk_2_id', 'blk_2_name', 'blk_2_score', 'blk_2_reason',
+                            'blk_3_id', 'blk_3_name', 'blk_3_score', 'blk_3_reason',
+                            'verification_pass', 'verification_reasons',
+                        ]
+                        if primary_output_choice == 'MMS':
+                            _mms_insert = review_cols.index('mapped_uae_assetid') + 1
+                            for _mc in reversed(['mms_asset_id', 'mms_asset_label', 'mms_lookup_status',
+                                                 'primary_output_id', 'primary_output_catalog']):
+                                review_cols.insert(_mms_insert, _mc)
+                            for _p in ('alt', 'blk'):
+                                for _i in range(1, 4):
+                                    _after = f'{_p}_{_i}_name'
+                                    if _after in review_cols:
+                                        _pos = review_cols.index(_after) + 1
+                                        for _mc in reversed([f'{_p}_{_i}_mms_id', f'{_p}_{_i}_mms_label']):
+                                            review_cols.insert(_pos, _mc)
+                        review_cols = [c for c in review_cols if c in df_review_combined.columns]
+                        df_review_combined[review_cols].to_excel(
+                            writer, sheet_name='Review Required', index=False)
 
                 # 4. AUTO-SELECTED PRODUCTS sheet - All auto-selected items with details
                 auto_selected_details = []
@@ -1568,7 +1571,7 @@ with tab2:
                             matched_v2.insert(insert_pos, 'nl_product_name', nl_names_v2)
                             suffix = ' - Matched (V2)'
                             safe_name = sheet_name[:31 - len(suffix)] + suffix
-                            out_mv2 = _apply_analyst_cols(_add_mms_resolution_hint(matched_v2), _get_matched_analyst_cols()) if _analyst_view else matched_v2
+                            out_mv2 = _apply_analyst_cols(matched_v2, _ANALYST_MATCHED_COLS) if _analyst_view else matched_v2
                             out_mv2.to_excel(writer, sheet_name=safe_name, index=False)
 
                     # Unmatched (V2) — per sheet
@@ -1577,7 +1580,7 @@ with tab2:
                         if len(unmatched_v2) > 0:
                             suffix = ' - Unmatched (V2)'
                             safe_name = sheet_name[:31 - len(suffix)] + suffix
-                            out_uv2 = _apply_analyst_cols(_add_mms_resolution_hint(unmatched_v2), _get_unmatched_analyst_cols()) if _analyst_view else unmatched_v2
+                            out_uv2 = _prepare_analyst_unmatched(unmatched_v2, df_nl_clean) if _analyst_view else unmatched_v2
                             out_uv2.to_excel(writer, sheet_name=safe_name, index=False)
 
                     # Review Required (V2) — combined, with alt columns
@@ -1622,35 +1625,40 @@ with tab2:
                                     df_rev_v2.at[idx, f'blk_{j}_name'] = b.get('uae_assetname', '')
                                     df_rev_v2.at[idx, f'blk_{j}_score'] = b.get('score', '')
                                     df_rev_v2.at[idx, f'blk_{j}_reason'] = b.get('reason', '')
-                        rev_cols_v2 = [
-                            'Source Sheet', 'original_input', 'category',
-                            'mapped_uae_assetid', 'nl_product_name',
-                            'match_score', 'match_status', 'confidence',
-                            'matched_on', 'method',
-                            'auto_selected', 'selection_reason',
-                            'review_reason', 'no_match_reason',
-                            'alt_1_id', 'alt_1_name', 'alt_1_score', 'alt_1_reason',
-                            'alt_2_id', 'alt_2_name', 'alt_2_score', 'alt_2_reason',
-                            'alt_3_id', 'alt_3_name', 'alt_3_score', 'alt_3_reason',
-                            'blk_1_id', 'blk_1_name', 'blk_1_score', 'blk_1_reason',
-                            'blk_2_id', 'blk_2_name', 'blk_2_score', 'blk_2_reason',
-                            'blk_3_id', 'blk_3_name', 'blk_3_score', 'blk_3_reason',
-                            'verification_pass', 'verification_reasons',
-                        ]
-                        if primary_output_choice == 'MMS':
-                            _ins = rev_cols_v2.index('mapped_uae_assetid') + 1
-                            for _mc in reversed(['mms_asset_id', 'mms_asset_label', 'mms_lookup_status',
-                                                 'primary_output_id', 'primary_output_catalog']):
-                                rev_cols_v2.insert(_ins, _mc)
-                            for _p in ('alt', 'blk'):
-                                for _i in range(1, 4):
-                                    _af = f'{_p}_{_i}_name'
-                                    if _af in rev_cols_v2:
-                                        _ps = rev_cols_v2.index(_af) + 1
-                                        for _mc in reversed([f'{_p}_{_i}_mms_id', f'{_p}_{_i}_mms_label']):
-                                            rev_cols_v2.insert(_ps, _mc)
-                        rev_cols_v2 = [c for c in rev_cols_v2 if c in df_rev_v2.columns]
-                        df_rev_v2[rev_cols_v2].to_excel(writer, sheet_name='Review Required (V2)', index=False)
+                        if _analyst_view:
+                            _apply_analyst_review(df_rev_v2).to_excel(
+                                writer, sheet_name='Review Required (V2)', index=False)
+                        else:
+                            rev_cols_v2 = [
+                                'Source Sheet', 'original_input', 'category',
+                                'mapped_uae_assetid', 'nl_product_name',
+                                'match_score', 'match_status', 'confidence',
+                                'matched_on', 'method',
+                                'auto_selected', 'selection_reason',
+                                'review_reason', 'no_match_reason',
+                                'alt_1_id', 'alt_1_name', 'alt_1_score', 'alt_1_reason',
+                                'alt_2_id', 'alt_2_name', 'alt_2_score', 'alt_2_reason',
+                                'alt_3_id', 'alt_3_name', 'alt_3_score', 'alt_3_reason',
+                                'blk_1_id', 'blk_1_name', 'blk_1_score', 'blk_1_reason',
+                                'blk_2_id', 'blk_2_name', 'blk_2_score', 'blk_2_reason',
+                                'blk_3_id', 'blk_3_name', 'blk_3_score', 'blk_3_reason',
+                                'verification_pass', 'verification_reasons',
+                            ]
+                            if primary_output_choice == 'MMS':
+                                _ins = rev_cols_v2.index('mapped_uae_assetid') + 1
+                                for _mc in reversed(['mms_asset_id', 'mms_asset_label', 'mms_lookup_status',
+                                                     'primary_output_id', 'primary_output_catalog']):
+                                    rev_cols_v2.insert(_ins, _mc)
+                                for _p in ('alt', 'blk'):
+                                    for _i in range(1, 4):
+                                        _af = f'{_p}_{_i}_name'
+                                        if _af in rev_cols_v2:
+                                            _ps = rev_cols_v2.index(_af) + 1
+                                            for _mc in reversed([f'{_p}_{_i}_mms_id', f'{_p}_{_i}_mms_label']):
+                                                rev_cols_v2.insert(_ps, _mc)
+                            rev_cols_v2 = [c for c in rev_cols_v2 if c in df_rev_v2.columns]
+                            df_rev_v2[rev_cols_v2].to_excel(
+                                writer, sheet_name='Review Required (V2)', index=False)
 
                     # Auto-Selected Products (V2)
                     auto_v2_details = []
@@ -1973,7 +1981,7 @@ if tab3 is not None:
                             if len(matched) > 0:
                                 suffix = ' - Matched'
                                 safe_name = sheet_name[:31 - len(suffix)] + suffix
-                                out_m = _apply_analyst_cols(_add_mms_resolution_hint(matched), _get_matched_analyst_cols()) if _analyst_view else matched
+                                out_m = _apply_analyst_cols(matched, _ANALYST_MATCHED_COLS) if _analyst_view else matched
                                 out_m.to_excel(writer, sheet_name=safe_name, index=False)
 
                         # 2. UNMATCHED sheets
@@ -1982,7 +1990,7 @@ if tab3 is not None:
                             if len(unmatched) > 0:
                                 suffix = ' - Unmatched'
                                 safe_name = sheet_name[:31 - len(suffix)] + suffix
-                                out_u = _apply_analyst_cols(_add_mms_resolution_hint(unmatched), _get_unmatched_analyst_cols()) if _analyst_view else unmatched
+                                out_u = _prepare_analyst_unmatched(unmatched, df_nl_clean) if _analyst_view else unmatched
                                 out_u.to_excel(writer, sheet_name=safe_name, index=False)
 
                         # 3. REVIEW REQUIRED sheet (curated columns to avoid NaN across sheets)
@@ -1995,21 +2003,26 @@ if tab3 is not None:
 
                         if all_review_required:
                             df_review_combined = pd.concat(all_review_required, ignore_index=True)
-                            review_cols = [
-                                'Source Sheet', 'original_input', 'category',
-                                'mapped_uae_assetid',
-                                'match_score', 'match_status',
-                                'confidence', 'matched_on', 'method',
-                                'auto_selected', 'selection_reason', 'alternatives',
-                                'verification_pass', 'verification_reasons',
-                            ]
-                            if primary_output_choice == 'MMS':
-                                _ins = review_cols.index('mapped_uae_assetid') + 1
-                                for _mc in reversed(['mms_asset_id', 'mms_asset_label', 'mms_lookup_status',
-                                                     'primary_output_id', 'primary_output_catalog']):
-                                    review_cols.insert(_ins, _mc)
-                            review_cols = [c for c in review_cols if c in df_review_combined.columns]
-                            df_review_combined[review_cols].to_excel(writer, sheet_name='Review Required', index=False)
+                            if _analyst_view:
+                                _apply_analyst_review(df_review_combined).to_excel(
+                                    writer, sheet_name='Review Required', index=False)
+                            else:
+                                review_cols = [
+                                    'Source Sheet', 'original_input', 'category',
+                                    'mapped_uae_assetid',
+                                    'match_score', 'match_status',
+                                    'confidence', 'matched_on', 'method',
+                                    'auto_selected', 'selection_reason', 'alternatives',
+                                    'verification_pass', 'verification_reasons',
+                                ]
+                                if primary_output_choice == 'MMS':
+                                    _ins = review_cols.index('mapped_uae_assetid') + 1
+                                    for _mc in reversed(['mms_asset_id', 'mms_asset_label', 'mms_lookup_status',
+                                                         'primary_output_id', 'primary_output_catalog']):
+                                        review_cols.insert(_ins, _mc)
+                                review_cols = [c for c in review_cols if c in df_review_combined.columns]
+                                df_review_combined[review_cols].to_excel(
+                                    writer, sheet_name='Review Required', index=False)
 
                         # 4. AUTO-SELECTED PRODUCTS sheet (with overrides marked)
                         auto_selected_details = []

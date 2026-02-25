@@ -288,10 +288,15 @@ _COLOR_WORDS = {
     'bleu', 'noir', 'vert', 'rose', 'jaune', 'rouge', 'blanc', 'gris',
     'argent', 'or', 'violet', 'orange', 'corail', 'sideral', 'ciel',
     'sable', 'lumiere', 'minuit', 'creme',
+    # Dutch (Forza / Dutch recommerce platforms)
+    'blauw', 'zwart', 'paars', 'wit', 'groen', 'roze', 'goud', 'grijs',
+    'rood', 'zilver', 'geel', 'bruin', 'oranje', 'koraal',
     # English
     'black', 'white', 'blue', 'green', 'red', 'gold', 'silver', 'purple',
     'pink', 'yellow', 'orange', 'coral', 'graphite', 'midnight', 'starlight',
-    'cream', 'titanium', 'space', 'grey', 'gray', 'sierra',
+    'cream', 'titanium', 'space', 'grey', 'gray', 'sierra', 'natural',
+    # Compound color words (joined in URL slugs, no separating space)
+    'spacegray', 'spacegrey', 'spacegrijs',
 }
 
 def strip_color_words(text: str) -> str:
@@ -310,6 +315,52 @@ def strip_color_words(text: str) -> str:
         return text
     words = text.split()
     filtered = [w for w in words if w.lower() not in _COLOR_WORDS]
+    return ' '.join(filtered).strip()
+
+
+# Noise tokens that appear in recommerce URL slugs but carry no product identity.
+# Applied ONLY to names extracted from URLs (not to human-written product names).
+_URL_NOISE_WORDS = {
+    # SIM configuration
+    'nano', 'dual', 'sim', 'dualsim', 'simm', 'esim',
+    # Region / grade / condition
+    'eu', 'grade', 'refurbished',
+}
+
+
+def _clean_url_extracted_name(text: str) -> str:
+    """
+    Clean a product name that was extracted from a URL slug.
+
+    Strips color words AND URL-specific noise tokens (SIM type, region, grade).
+    Also handles trailing URL dedup digits on noise tokens (e.g., "titanium1", "sim1").
+
+    Examples:
+        'iphone 14 pro 256gb paars nano' → 'iphone 14 pro 256gb'
+        'samsung galaxy s23 5g 256gb zwart dual sim' → 'samsung galaxy s23 5g 256gb'
+        'iphone 15 256gb black eu a grade' → 'iphone 15 256gb'
+        'iphone 16 pro 256 gb titanium1' → 'iphone 16 pro 256 gb'
+    """
+    if not isinstance(text, str):
+        return text
+    # Strip trailing "a grade" / "b grade" / "c grade" patterns BEFORE word-level filtering
+    # (avoids stripping the "a" from "Galaxy A53")
+    text = re.sub(r'\b[abc]\s+grade\b', '', text, flags=re.IGNORECASE)
+    words = text.split()
+    noise = _COLOR_WORDS | _URL_NOISE_WORDS
+    filtered = []
+    for w in words:
+        wl = w.lower()
+        if wl in noise:
+            continue
+        # Strip trailing digits from URL dedup suffixes (e.g., "titanium1" → "titanium")
+        wl_stripped = re.sub(r'\d+$', '', wl)
+        if wl_stripped and wl_stripped in noise:
+            continue
+        filtered.append(w)
+    # Remove trailing standalone single digits (URL dedup: "...paars-1" → "...1")
+    while filtered and re.fullmatch(r'\d{1,2}', filtered[-1]):
+        filtered.pop()
     return ' '.join(filtered).strip()
 
 
@@ -633,6 +684,76 @@ def is_laptop_product(text: str) -> bool:
     return any(kw in text_lower for kw in laptop_keywords)
 
 
+# ---------------------------------------------------------------------------
+# V2-only: EU laptop query normalization
+# ---------------------------------------------------------------------------
+
+# Retail noise tokens to strip from laptop queries (case-insensitive).
+# These appear in EU recommerce data but carry no identity signal.
+_LAPTOP_NOISE_TOKENS = re.compile(
+    r'\b(?:'
+    r'tbt[34]?|tb[34]|thunderbolt\s*\d?'
+    r'|wi[\- ]?fi\s*\d*[a-z]?'
+    r'|wlan|bluetooth|bt\s*\d*\.?\d*'
+    r'|usb[\- ]?c?|hdmi|nfc'
+    r'|backlit|fingerprint|webcam|touchscreen'
+    r'|ips|oled|retina|fhd|qhd|uhd|wuxga|wqxga'
+    r')\b',
+    re.IGNORECASE,
+)
+
+# Screen size with quote/inch symbol → "NN inch"
+_SCREEN_SIZE_QUOTE = re.compile(r'(\d+\.?\d*)\s*[""″\u201c\u201d]')
+_SCREEN_SIZE_INCH = re.compile(r'(\d+\.?\d*)\s*inch(?:es)?\b', re.IGNORECASE)
+
+
+def normalize_laptop_query_text_v2(text: str) -> str:
+    """V2-only normalization for EU retail laptop strings.
+
+    Applied BEFORE attribute extraction / candidate retrieval.
+    Cleans retail noise while preserving identity tokens
+    (brand, family, CPU, RAM, storage, year, chip).
+
+    Examples:
+        'MacBook Pro (13" 2020, 4 TBT3)' → 'MacBook Pro 13 inch 2020'
+        'HP EliteBook 840 G8 14" i5 Wi-Fi 6E 16GB 512GB'
+            → 'HP EliteBook 840 G8 14 inch i5 16GB 512GB'
+    """
+    if not text:
+        return text
+
+    s = str(text)
+
+    # 1. Normalize screen size: 13" → 13 inch, 15.6" → 15.6 inch
+    s = _SCREEN_SIZE_QUOTE.sub(r'\1 inch', s)
+    # Ensure existing "inch" forms are canonical
+    s = _SCREEN_SIZE_INCH.sub(r'\1 inch', s)
+
+    # 2. Parentheses cleanup: extract identity fragments, drop noise.
+    #    "(13 inch 2020, 4 TBT3)" → keep "13 inch 2020", drop "4 TBT3"
+    def _clean_parens(m):
+        inner = m.group(1)
+        # Split on comma; keep fragments with identity tokens
+        parts = [p.strip() for p in inner.split(',')]
+        kept = []
+        for p in parts:
+            p_low = p.lower()
+            # Keep if it contains: year, inch, chip name, storage, ram, gen
+            if re.search(r'\b(20[12]\d|inch|m[1234]|i[3579]|ryzen|core|gen\s?\d|\d+\s*gb|\d+\s*tb)\b', p_low):
+                kept.append(p)
+        return ' ' + ' '.join(kept) + ' ' if kept else ' '
+
+    s = re.sub(r'\(([^)]*)\)', _clean_parens, s)
+
+    # 3. Remove retail noise tokens (TBT3, Wi-Fi 6E, WLAN, BT, etc.)
+    s = _LAPTOP_NOISE_TOKENS.sub(' ', s)
+
+    # 4. Collapse whitespace
+    s = re.sub(r'\s+', ' ', s).strip()
+
+    return s
+
+
 def extract_laptop_attributes(text: str, brand: str) -> Dict[str, str]:
     """
     Extract laptop-specific attributes for matching.
@@ -691,17 +812,62 @@ def extract_laptop_attributes(text: str, brand: str) -> Dict[str, str]:
         if year_match:
             cpu_gen = year_match.group(1)
 
+    # --- Screen size extraction (Task 1A) ---
+    screen_inches = ''
+    _si = re.search(r'\b(\d{2}(?:\.\d)?)\s*(?:inch|")\b', text_lower)
+    if not _si:
+        # Fallback: already-normalized "NN inch" from v2 normalization
+        _si = re.search(r'\b(\d{2}(?:\.\d)?)\s+inch\b', text_norm)
+    if _si:
+        screen_inches = _si.group(1)
+
+    # --- Apple chip extraction (Task 1B) ---
+    apple_chip = ''
+    if brand_norm == 'apple' or 'macbook' in text_lower:
+        _ac = re.search(
+            r'\bm([1234])\s*(pro|max|ultra)?\b', text_lower)
+        if _ac:
+            apple_chip = f'm{_ac.group(1)}'
+            if _ac.group(2):
+                apple_chip += f' {_ac.group(2)}'
+
+    # --- Year extraction ---
+    year = ''
+    _yr = re.search(r'\b(20[12]\d)\b', text)
+    if _yr:
+        year = _yr.group(1)
+
+    # --- Dual-storage detection (Task 1C) ---
+    storage_ambiguous = False
+    storage_list = []
+    _all_gb = re.findall(r'(\d+)\s*gb', text_lower)
+    _all_tb = re.findall(r'(\d+)\s*tb\b', text_lower)
+    _gb_vals = [int(v) for v in _all_gb]
+    _tb_vals = [int(v) * 1024 for v in _all_tb]
+    ram_int = int(ram.replace('gb', '')) if ram else 0
+    _storage_vals = sorted(set(
+        [v for v in _gb_vals if v >= 128 and v != ram_int] + _tb_vals
+    ))
+    if len(_storage_vals) >= 2:
+        storage_ambiguous = True
+        storage_list = _storage_vals
+
     attrs = {
         'brand': brand_norm,
         'product_line': '',
-        'processor': processor,      # NEW: i3, i5, i7, i9, m1, m2, etc.
-        'generation': cpu_gen,        # NEW: 11th gen, 8th gen, m1, etc.
+        'processor': processor,      # i3, i5, i7, i9, m1, m2, etc.
+        'generation': cpu_gen,        # 11th gen, 8th gen, m1, etc.
         'model': cpu_gen,             # DEPRECATED: kept for backward compatibility
         'storage': storage,
         'ram': ram,
         'platform_code': '',         # Dell 5420, HP 840 g8, Lenovo t14, etc.
         'laptop_family': '',         # sub-series: swift 3, rog strix, pavilion 15
         'model_code': '',            # hardware code: sf314, ux325, fx504
+        'screen_inches': screen_inches,     # 13, 14, 15.6, 16, 17.3
+        'apple_chip': apple_chip,           # m1, m1 pro, m2 max, etc.
+        'year': year,                       # 2020, 2023, etc.
+        'storage_ambiguous': storage_ambiguous,  # True if 2+ storage sizes
+        'storage_list': storage_list,            # [256, 1024] sorted GB values
     }
 
     # Extract laptop product lines by brand
@@ -940,6 +1106,52 @@ def extract_laptop_attributes(text: str, brand: str) -> Dict[str, str]:
                 attrs['model'] = cpu_gen
 
     return attrs
+
+
+# ---------------------------------------------------------------------------
+# Laptop policy class (Task 2)
+# ---------------------------------------------------------------------------
+
+_GAMING_KEYWORDS = {
+    'rog', 'tuf', 'nitro', 'predator', 'legion', 'omen', 'victus',
+    'alienware', 'raider', 'stealth', 'katana', 'crosshair',
+    'gaming',
+}
+
+_BUSINESS_LINES = {
+    'latitude', 'precision', 'thinkpad', 'elitebook', 'probook',
+    'zbook', 'surface laptop', 'surface book', 'expertbook',
+    'travelmate',
+}
+
+
+def laptop_policy_class(query_text: str, brand: str, attrs: Dict) -> str:
+    """Classify a laptop into a policy class for completeness thresholds.
+
+    Returns one of:
+        'APPLE_MACBOOK', 'WINDOWS_BUSINESS', 'WINDOWS_GAMING', 'WINDOWS_OTHER'
+    """
+    text_low = query_text.lower()
+    brand_norm = (normalize_brand(brand) if brand else '') or ''
+    pl = attrs.get('product_line', '')
+
+    # Apple MacBook
+    if brand_norm == 'apple' or 'macbook' in text_low:
+        if 'macbook air' in text_low or 'macbook pro' in text_low or pl in ('macbook air', 'macbook pro', 'macbook'):
+            return 'APPLE_MACBOOK'
+
+    # Gaming: keyword or GPU token present
+    if any(kw in text_low for kw in _GAMING_KEYWORDS):
+        return 'WINDOWS_GAMING'
+    # GPU tokens (gtx, rtx, rx, geforce, radeon)
+    if re.search(r'\b(gtx|rtx|geforce|radeon|rx\s*\d)\b', text_low):
+        return 'WINDOWS_GAMING'
+
+    # Business
+    if pl in _BUSINESS_LINES:
+        return 'WINDOWS_BUSINESS'
+
+    return 'WINDOWS_OTHER'
 
 
 def extract_watch_material(text_norm: str) -> str:
@@ -3907,220 +4119,374 @@ def match_laptop_by_attributes(
     nl_catalog: Optional[pd.DataFrame] = None,
 ) -> Optional[dict]:
     """
-    Match laptops by attributes instead of model numbers.
+    Match laptops by attributes with policy-class completeness gates.
 
-    For Windows laptops, ignore model numbers (SP513-55N, UX325, etc.) and match by:
-    - Brand (already filtered)
-    - Series (Spin 5, ZenBook, VivoBook)
-    - Processor tier (i3, i5, i7, i9)
-    - Generation (11th Gen, 8th Gen, etc.)
-    - RAM (8GB, 16GB, etc.)
-    - Storage (256GB SSD, 512GB SSD, etc.)
+    Uses laptop_policy_class() to determine minimum attribute requirements,
+    then cross-join scores all candidates. Dual-storage queries always go
+    to REVIEW_REQUIRED. Score margin between top-1 and top-2 must exceed
+    threshold for MATCHED; otherwise REVIEW with top-3 alternatives.
+
+    Scoring weights:
+        +100  platform_code / model_code exact match
+        +40   processor tier match (i3/i5/i7/i9/ryzen)
+        +40   generation match
+        +30   RAM match
+        +30   storage match
+        +10   screen_inches match
 
     Returns match dict or None if no good match found.
     """
-    # Extract attributes from query
+    # ── Extract query attributes ──────────────────────────────────────
     query_attrs = extract_laptop_attributes(query, input_brand)
+    policy = laptop_policy_class(original_input or query, input_brand, query_attrs)
 
-    # Required attributes for matching
-    query_processor = query_attrs.get('processor', '')
-    query_gen = query_attrs.get('generation', '')
-    query_ram = query_attrs.get('ram', '')
-    query_storage = query_attrs.get('storage', '')
-    query_line = query_attrs.get('product_line', '')
-    query_pc = query_attrs.get('platform_code', '')
+    q_proc = query_attrs.get('processor', '')
+    q_gen = query_attrs.get('generation', '')
+    q_ram = query_attrs.get('ram', '')
+    q_storage = query_attrs.get('storage', '')
+    q_line = query_attrs.get('product_line', '')
+    q_pc = query_attrs.get('platform_code', '')
+    q_fam = query_attrs.get('laptop_family', '')
+    q_mc = query_attrs.get('model_code', '')
+    q_screen = query_attrs.get('screen_inches', '')
+    q_chip = query_attrs.get('apple_chip', '')
+    q_year = query_attrs.get('year', '')
+    q_dual = query_attrs.get('storage_ambiguous', False)
 
-    if not (query_processor and query_ram and query_storage):
-        # Missing critical attributes, fall back to fuzzy matching
-        return None
+    # ── Minimum extraction gate — need *something* to score on ────────
+    if policy == 'APPLE_MACBOOK':
+        # Apple: need at least product_line (air/pro) + one of storage/chip/year
+        if not q_line:
+            return None
+        if not (q_storage or q_chip or q_year):
+            return None
+    else:
+        # Windows: need at least processor + RAM + storage
+        if not (q_proc and q_ram and q_storage):
+            return None
 
-    # Score each candidate by attribute matching
-    best_score = 0
-    best_match = None
-    best_match_name = ''
+    # ── Build candidate pool ──────────────────────────────────────────
+    laptop_names = [n for n in search_names if is_laptop_product(n)]
 
-    for nl_name in search_names:
-        # Skip non-laptops
-        if not is_laptop_product(nl_name):
-            continue
+    # Pre-filter by product_line when query specifies one
+    if q_line and laptop_names:
+        line_filtered = []
+        for n in laptop_names:
+            na = extract_laptop_attributes(n, input_brand)
+            nl_pl = na.get('product_line', '')
+            if nl_pl and (nl_pl == q_line or nl_pl in q_line or q_line in nl_pl):
+                line_filtered.append(n)
+        if line_filtered:
+            laptop_names = line_filtered
 
-        # Extract attributes from NL candidate
+    # ── Cross-join scoring ────────────────────────────────────────────
+    scored = []  # list of (score, nl_name, nl_attrs, match_detail)
+
+    for nl_name in laptop_names:
         nl_attrs = extract_laptop_attributes(nl_name, input_brand)
-        nl_processor = nl_attrs.get('processor', '')
+        nl_proc = nl_attrs.get('processor', '')
         nl_gen = nl_attrs.get('generation', '')
         nl_ram = nl_attrs.get('ram', '')
         nl_storage = nl_attrs.get('storage', '')
         nl_line = nl_attrs.get('product_line', '')
         nl_pc = nl_attrs.get('platform_code', '')
-
-        # Attribute-based scoring (0-100 scale)
-        score = 0
-
-        # CRITICAL: Processor tier must match exactly (i5 != i7)
-        if query_processor != nl_processor:
-            continue  # Skip this candidate entirely
-        else:
-            score += 30  # Processor match is critical
-
-        # CRITICAL: RAM must match exactly (8GB != 16GB)
-        if query_ram != nl_ram:
-            continue  # Skip this candidate entirely
-        else:
-            score += 25  # RAM match is critical
-
-        # CRITICAL: Storage must match exactly (256GB != 512GB)
-        if query_storage != nl_storage:
-            continue  # Skip this candidate entirely
-        else:
-            score += 25  # Storage match is critical
-
-        # CRITICAL: Generation must match EXACTLY (11th != 10th, m1 != m2)
-        # No tolerance — even ±1 generation can mean different CPUs/performance
-        if query_gen and nl_gen:
-            if query_gen == nl_gen:
-                score += 15  # Exact generation match
-            else:
-                # Different generation → skip entirely (no ±1 tolerance)
-                continue
-        elif query_gen or nl_gen:
-            # One has generation, other doesn't → skip
-            continue
-        else:
-            # Neither has generation (older laptops without clear gen marking)
-            score += 5
-
-        # Product line: CRITICAL - Must match if both specified
-        # Prevents: MacBook Air→Pro, Aspire→Predator, etc.
-        if query_line and nl_line:
-            # Check for exact or partial match (e.g., "macbook pro" matches "macbook pro 13")
-            if query_line == nl_line or query_line in nl_line or nl_line in query_line:
-                score += 15  # Product line match is critical for laptops
-            else:
-                # Different series (Air vs Pro, Aspire vs Predator) - skip entirely
-                continue
-        elif query_line or nl_line:
-            # One has series, other doesn't - allow with reduced confidence
-            score += 5
-
-        # Platform code: if both have it and they differ → reject
-        # Prevents: Latitude 5420 matching Latitude 5520 (different hardware)
-        if query_pc and nl_pc and query_pc != nl_pc:
-            continue
-        elif query_pc and nl_pc and query_pc == nl_pc:
-            score += 5  # Bonus for exact platform code match
-
-        # Laptop family (sub-series): skip on mismatch, bonus on match
-        # Prevents: Swift 3 matching Swift 5, ROG Strix matching ROG Zephyrus
-        q_fam = query_attrs.get('laptop_family', '')
         nl_fam = nl_attrs.get('laptop_family', '')
-        if q_fam and nl_fam:
-            if q_fam != nl_fam:
-                continue  # Different sub-series → skip
-            else:
-                score += 10
-
-        # Model code (Acer/ASUS hardware ID): skip on mismatch, bonus on match
-        q_mc = query_attrs.get('model_code', '')
         nl_mc = nl_attrs.get('model_code', '')
-        if q_mc and nl_mc:
-            if q_mc != nl_mc:
-                continue  # Different hardware model → skip
-            else:
-                score += 10
+        nl_screen = nl_attrs.get('screen_inches', '')
+        nl_chip = nl_attrs.get('apple_chip', '')
+        nl_year = nl_attrs.get('year', '')
 
-        if score > best_score:
-            best_score = score
-            best_match_name = nl_name
+        score = 0
+        detail = []
 
-    if best_score >= 85:  # Minimum 85% attribute match (processor + RAM + storage + series = 95 points base)
-        asset_ids = search_lookup.get(best_match_name, [])
+        # --- Hard rejections (skip candidate entirely) ---
+        # Product line mismatch (Air != Pro, Aspire != Predator)
+        if q_line and nl_line:
+            if not (q_line == nl_line or q_line in nl_line or nl_line in q_line):
+                continue
+        # Laptop family mismatch (Swift 3 != Swift 5)
+        if q_fam and nl_fam and q_fam != nl_fam:
+            continue
+        # Model code mismatch (sf314 != sf514)
+        if q_mc and nl_mc and q_mc != nl_mc:
+            continue
+        # Platform code mismatch (latitude 5420 != 5520)
+        if q_pc and nl_pc and q_pc != nl_pc:
+            continue
+        # Processor tier mismatch (i5 != i7) — hard reject for Windows
+        if policy != 'APPLE_MACBOOK':
+            if q_proc and nl_proc and q_proc != nl_proc:
+                continue
+        # Generation mismatch — hard reject
+        if q_gen and nl_gen and q_gen != nl_gen:
+            continue
+        # RAM mismatch — hard reject for Windows
+        if policy != 'APPLE_MACBOOK':
+            if q_ram and nl_ram and q_ram != nl_ram:
+                continue
+        # Storage mismatch — hard reject
+        if q_storage and nl_storage and q_storage != nl_storage:
+            continue
+        # Apple chip mismatch — hard reject
+        if q_chip and nl_chip and q_chip != nl_chip:
+            continue
 
-        if len(asset_ids) == 1:
+        # --- Positive scoring ---
+        # Platform code / model code: +100
+        if q_pc and nl_pc and q_pc == nl_pc:
+            score += 100
+            detail.append('code_match')
+        elif q_mc and nl_mc and q_mc == nl_mc:
+            score += 100
+            detail.append('code_match')
+
+        # Processor tier: +40
+        if q_proc and nl_proc and q_proc == nl_proc:
+            score += 40
+            detail.append('cpu')
+
+        # Generation: +40
+        if q_gen and nl_gen and q_gen == nl_gen:
+            score += 40
+            detail.append('gen')
+
+        # RAM: +30
+        if q_ram and nl_ram and q_ram == nl_ram:
+            score += 30
+            detail.append('ram')
+
+        # Storage: +30
+        if q_storage and nl_storage and q_storage == nl_storage:
+            score += 30
+            detail.append('storage')
+
+        # Screen: +10
+        if q_screen and nl_screen and q_screen == nl_screen:
+            score += 10
+            detail.append('screen')
+
+        # Product line match bonus: +15
+        if q_line and nl_line:
+            if q_line == nl_line or q_line in nl_line or nl_line in q_line:
+                score += 15
+                detail.append('line')
+
+        # Apple chip match: +40 (replaces cpu+gen for Apple)
+        if q_chip and nl_chip and q_chip == nl_chip:
+            score += 40
+            detail.append('chip')
+
+        # Year match: +10
+        if q_year and nl_year and q_year == nl_year:
+            score += 10
+            detail.append('year')
+
+        if score > 0:
+            scored.append((score, nl_name, nl_attrs, detail))
+
+    # Sort by score descending
+    scored.sort(key=lambda x: -x[0])
+
+    if not scored:
+        return None
+
+    # ── Policy-class completeness gate ────────────────────────────────
+    # Even if we have a high-scoring candidate, the query must have enough
+    # attributes for MATCHED; otherwise force REVIEW_REQUIRED.
+    def _check_completeness() -> tuple:
+        """Returns (passes: bool, missing: list[str])."""
+        missing = []
+        if policy == 'APPLE_MACBOOK':
+            # Need: product_line + screen OR chip OR year + storage
+            if not q_line:
+                missing.append('product_line')
+            if not q_storage:
+                missing.append('storage')
+            if not (q_chip or q_year or q_screen):
+                missing.append('chip_or_year_or_screen')
+        elif policy == 'WINDOWS_BUSINESS':
+            # Need: cpu + gen + ram + storage + (platform_code OR laptop_family)
+            if not q_proc:
+                missing.append('processor')
+            if not q_gen:
+                missing.append('generation')
+            if not q_ram:
+                missing.append('ram')
+            if not q_storage:
+                missing.append('storage')
+            if not (q_pc or q_fam):
+                missing.append('code_or_family')
+        elif policy == 'WINDOWS_GAMING':
+            # Need: (model_code + specs) OR (laptop_family + specs)
+            # specs = cpu + ram + storage
+            if not q_proc:
+                missing.append('processor')
+            if not q_ram:
+                missing.append('ram')
+            if not q_storage:
+                missing.append('storage')
+            if not (q_mc or q_fam or q_pc):
+                missing.append('code_or_family')
+        else:  # WINDOWS_OTHER
+            # Same as BUSINESS
+            if not q_proc:
+                missing.append('processor')
+            if not q_gen:
+                missing.append('generation')
+            if not q_ram:
+                missing.append('ram')
+            if not q_storage:
+                missing.append('storage')
+            if not (q_pc or q_fam):
+                missing.append('code_or_family')
+        return len(missing) == 0, missing
+
+    complete, missing_attrs = _check_completeness()
+
+    # ── Dual-storage: always REVIEW_REQUIRED ──────────────────────────
+    if q_dual:
+        top3 = scored[:3]
+        alts = []
+        for _, cname, _, _ in top3:
+            for aid in search_lookup.get(cname, []):
+                if aid not in alts:
+                    alts.append(aid)
+        return {
+            'mapped_uae_assetid': alts[0] if alts else '',
+            'match_score': round(scored[0][0], 2),
+            'match_status': MATCH_STATUS_SUGGESTED,
+            'confidence': CONFIDENCE_MEDIUM,
+            'matched_on': scored[0][1],
+            'method': 'laptop_attribute_match',
+            'auto_selected': False,
+            'selection_reason': f'dual_storage({query_attrs.get("storage_list", [])}); top candidates shown',
+            'alternatives': alts[1:] if len(alts) > 1 else [],
+            'review_reason': 'DUAL_STORAGE',
+        }
+
+    # ── Decide MATCHED vs REVIEW ──────────────────────────────────────
+    top_score, top_name, top_attrs, top_detail = scored[0]
+    second_score = scored[1][0] if len(scored) > 1 else 0
+    MARGIN = 10  # top must lead by at least 10 points
+
+    # Collect top-3 alternative asset IDs for REVIEW output
+    def _top3_alt_ids():
+        alt_ids = []
+        for _, cname, _, _ in scored[:3]:
+            for aid in search_lookup.get(cname, []):
+                if aid not in alt_ids:
+                    alt_ids.append(aid)
+        return alt_ids
+
+    # Minimum score threshold: 85 for code-based, 100 for attribute-only
+    has_code = any(d == 'code_match' for d in top_detail)
+    min_threshold = 85 if has_code else 100
+
+    if top_score < min_threshold:
+        # Score too low even for REVIEW
+        if top_score >= 60:
+            alts = _top3_alt_ids()
             return {
-                'mapped_uae_assetid': asset_ids[0],
-                'match_score': round(best_score, 2),
-                'match_status': MATCH_STATUS_MATCHED,
-                'confidence': CONFIDENCE_HIGH,
-                'matched_on': best_match_name,
+                'mapped_uae_assetid': alts[0] if alts else '',
+                'match_score': round(top_score, 2),
+                'match_status': MATCH_STATUS_SUGGESTED,
+                'confidence': CONFIDENCE_LOW,
+                'matched_on': top_name,
                 'method': 'laptop_attribute_match',
                 'auto_selected': False,
-                'selection_reason': '',
-                'alternatives': [],
+                'selection_reason': f'below threshold ({top_score}<{min_threshold}); attrs={"+".join(top_detail)}',
+                'alternatives': alts[1:] if len(alts) > 1 else [],
             }
+        return None
 
-        # --- Multi-ID: try tie-breaking with platform_code / model_code ---
-        if len(asset_ids) > 1 and nl_catalog is not None:
-            q_pc = query_attrs.get('platform_code', '')
-            q_mc = query_attrs.get('model_code', '')
+    # Completeness or margin fail → REVIEW_REQUIRED
+    if not complete or (top_score - second_score) < MARGIN:
+        alts = _top3_alt_ids()
+        reason_parts = []
+        if not complete:
+            reason_parts.append(f'incomplete({",".join(missing_attrs)})')
+        if (top_score - second_score) < MARGIN:
+            reason_parts.append(f'margin({top_score}-{second_score}={top_score - second_score}<{MARGIN})')
+        return {
+            'mapped_uae_assetid': alts[0] if alts else '',
+            'match_score': round(top_score, 2),
+            'match_status': MATCH_STATUS_SUGGESTED,
+            'confidence': CONFIDENCE_MEDIUM,
+            'matched_on': top_name,
+            'method': 'laptop_attribute_match',
+            'auto_selected': False,
+            'selection_reason': '; '.join(reason_parts) + f'; attrs={"+".join(top_detail)}',
+            'alternatives': alts[1:] if len(alts) > 1 else [],
+        }
 
-            if q_pc or q_mc:
-                # Try to narrow candidates using query's specific code
-                narrowed = []
-                for aid in asset_ids:
-                    row = nl_catalog[nl_catalog['uae_assetid'] == aid]
-                    if row.empty:
-                        continue
-                    nl_name_raw = str(row.iloc[0].get('uae_assetname', ''))
-                    nl_a = extract_laptop_attributes(nl_name_raw, input_brand)
-                    nl_pc = nl_a.get('platform_code', '')
-                    nl_mc = nl_a.get('model_code', '')
-                    # Accept if code matches on whichever query specifies
-                    if q_pc and nl_pc and q_pc == nl_pc:
-                        narrowed.append(aid)
-                    elif q_mc and nl_mc and q_mc == nl_mc:
-                        narrowed.append(aid)
+    # ── MATCHED path — single best candidate, passes all gates ────────
+    asset_ids = search_lookup.get(top_name, [])
 
-                if len(narrowed) == 1:
-                    others = [a for a in asset_ids if a != narrowed[0]]
-                    return {
-                        'mapped_uae_assetid': narrowed[0],
-                        'match_score': round(best_score, 2),
-                        'match_status': MATCH_STATUS_MATCHED,
-                        'confidence': CONFIDENCE_HIGH,
-                        'matched_on': best_match_name,
-                        'method': 'laptop_attribute_match',
-                        'auto_selected': True,
-                        'selection_reason': f'platform/model code tie-break: {q_pc or q_mc}',
-                        'alternatives': others,
-                    }
+    if len(asset_ids) == 1:
+        return {
+            'mapped_uae_assetid': asset_ids[0],
+            'match_score': round(top_score, 2),
+            'match_status': MATCH_STATUS_MATCHED,
+            'confidence': CONFIDENCE_HIGH,
+            'matched_on': top_name,
+            'method': 'laptop_attribute_match',
+            'auto_selected': False,
+            'selection_reason': f'policy={policy}; attrs={"+".join(top_detail)}',
+            'alternatives': [],
+        }
 
-            # No tie-breaker resolved => REVIEW_REQUIRED with all candidates
-            # Build alternative names for transparency
-            alt_details = []
+    # --- Multi-ID: try tie-breaking with platform_code / model_code ---
+    if len(asset_ids) > 1 and nl_catalog is not None:
+        if q_pc or q_mc:
+            narrowed = []
             for aid in asset_ids:
                 row = nl_catalog[nl_catalog['uae_assetid'] == aid]
-                if not row.empty:
-                    alt_details.append(f'{aid} ({str(row.iloc[0].get("uae_assetname", ""))})')
-                else:
-                    alt_details.append(aid)
+                if row.empty:
+                    continue
+                nl_name_raw = str(row.iloc[0].get('uae_assetname', ''))
+                nl_a = extract_laptop_attributes(nl_name_raw, input_brand)
+                nl_pc_c = nl_a.get('platform_code', '')
+                nl_mc_c = nl_a.get('model_code', '')
+                if q_pc and nl_pc_c and q_pc == nl_pc_c:
+                    narrowed.append(aid)
+                elif q_mc and nl_mc_c and q_mc == nl_mc_c:
+                    narrowed.append(aid)
 
-            return {
-                'mapped_uae_assetid': ', '.join(asset_ids),
-                'match_score': round(best_score, 2),
-                'match_status': MATCH_STATUS_SUGGESTED,
-                'confidence': CONFIDENCE_MEDIUM,
-                'matched_on': best_match_name,
-                'method': 'laptop_attribute_match',
-                'auto_selected': False,
-                'selection_reason': f'multiple NL IDs, no tie-breaker; candidates: {"; ".join(alt_details)}',
-                'alternatives': asset_ids,
-            }
+            if len(narrowed) == 1:
+                others = [a for a in asset_ids if a != narrowed[0]]
+                return {
+                    'mapped_uae_assetid': narrowed[0],
+                    'match_score': round(top_score, 2),
+                    'match_status': MATCH_STATUS_MATCHED,
+                    'confidence': CONFIDENCE_HIGH,
+                    'matched_on': top_name,
+                    'method': 'laptop_attribute_match',
+                    'auto_selected': True,
+                    'selection_reason': f'code tie-break: {q_pc or q_mc}; policy={policy}',
+                    'alternatives': others,
+                }
 
-        # Multi-ID but no catalog at all
-        if len(asset_ids) > 1:
-            return {
-                'mapped_uae_assetid': ', '.join(asset_ids),
-                'match_score': round(best_score, 2),
-                'match_status': MATCH_STATUS_SUGGESTED,
-                'confidence': CONFIDENCE_MEDIUM,
-                'matched_on': best_match_name,
-                'method': 'laptop_attribute_match',
-                'auto_selected': False,
-                'selection_reason': 'multiple NL IDs, no catalog available',
-                'alternatives': asset_ids,
-            }
+    # Multi-ID, no tie-breaker → REVIEW_REQUIRED with all candidates
+    alt_details = []
+    for aid in asset_ids:
+        if nl_catalog is not None:
+            row = nl_catalog[nl_catalog['uae_assetid'] == aid]
+            if not row.empty:
+                alt_details.append(f'{aid} ({str(row.iloc[0].get("uae_assetname", ""))})')
+                continue
+        alt_details.append(aid)
 
-    return None  # No good match found
+    return {
+        'mapped_uae_assetid': ', '.join(asset_ids),
+        'match_score': round(top_score, 2),
+        'match_status': MATCH_STATUS_SUGGESTED,
+        'confidence': CONFIDENCE_MEDIUM,
+        'matched_on': top_name,
+        'method': 'laptop_attribute_match',
+        'auto_selected': False,
+        'selection_reason': f'multiple NL IDs, no tie-breaker; candidates: {"; ".join(alt_details)}',
+        'alternatives': asset_ids,
+    }
 
 
 def match_single_item(
@@ -4324,8 +4690,12 @@ def _match_single_item_inner(
     # For Windows laptops, use attribute matching instead of fuzzy matching
     # to ignore model numbers (SP513-55N, UX325, etc.)
     if query_category == 'laptop' and is_laptop_product(query):
+        # V2: normalize EU retail noise before extraction & retrieval
+        query_laptop = normalize_laptop_query_text_v2(original_input or query)
+        query_laptop_norm = normalize_text(query_laptop)
+
         laptop_match = match_laptop_by_attributes(
-            query, input_brand, original_input,
+            query_laptop_norm, input_brand, original_input,
             search_names, search_lookup, nl_catalog
         )
         if laptop_match:
@@ -4333,10 +4703,11 @@ def _match_single_item_inner(
 
         # LAPTOP FALLBACK: brand-filtered fuzzy within laptop candidates only.
         # Returns REVIEW_REQUIRED (never MATCHED) with top-3 alternatives.
+        # V2: use the cleaned query for better fuzzy scoring.
         laptop_candidates = [n for n in search_names if is_laptop_product(n)]
         if laptop_candidates:
             top_matches = process.extract(
-                query, laptop_candidates,
+                query_laptop_norm, laptop_candidates,
                 scorer=fuzz.token_sort_ratio, limit=3,
             )
             if top_matches and top_matches[0][1] >= threshold:
@@ -4351,6 +4722,26 @@ def _match_single_item_inner(
                     'method': 'laptop_fuzzy_fallback',
                     'auto_selected': False,
                     'selection_reason': '',
+                    'alternatives': [
+                        (n, round(s, 2)) for n, s, _ in top_matches[1:]
+                    ],
+                }
+
+            # V2 Task B: Laptop-specific CATALOG_MISSING reclassification.
+            # If fuzzy fallback found candidates (score >= 60 but < threshold),
+            # promote to REVIEW_REQUIRED with top 3 instead of NO_MATCH.
+            if top_matches and top_matches[0][1] >= 60:
+                best_name, best_score, _ = top_matches[0]
+                asset_ids = search_lookup.get(best_name, [])
+                return {
+                    'mapped_uae_assetid': asset_ids[0] if asset_ids else '',
+                    'match_score': round(best_score, 2),
+                    'match_status': MATCH_STATUS_SUGGESTED,
+                    'confidence': CONFIDENCE_LOW,
+                    'matched_on': best_name,
+                    'method': 'laptop_retrieval_weak',
+                    'auto_selected': False,
+                    'selection_reason': 'weak retrieval — top candidates below threshold',
                     'alternatives': [
                         (n, round(s, 2)) for n, s, _ in top_matches[1:]
                     ],
@@ -4942,14 +5333,33 @@ def run_matching(
                     vr = match_result.get('verification_reasons', '')
                     if method in ('empty_input', 'missing_brand'):
                         no_match_reason = 'LOW_SIGNAL_INPUT'
-                    elif method == 'none' and score == 0:
-                        no_match_reason = 'CATALOG_MISSING_LIKELY'
                     elif 'identity_rejected' in method or 'gate_blocked' in method:
                         no_match_reason = 'BLOCKED_BY_GATE'
-                    elif score > 0 and score < threshold:
-                        no_match_reason = 'CATALOG_MISSING_LIKELY'
                     elif 'category_cross' in str(vr):
                         no_match_reason = 'TAXONOMY_MISMATCH'
+                    elif input_category and input_category.lower().strip() == 'laptop':
+                        # V2 Task B: stricter CATALOG_MISSING for laptops.
+                        # Only label CATALOG_MISSING_LIKELY when:
+                        # - brand known AND best candidate score < 75
+                        # - AND no high-signal family/platform code in query
+                        _q_laptop = normalize_laptop_query_text_v2(original_product_name)
+                        _q_attrs = extract_laptop_attributes(
+                            normalize_text(_q_laptop), input_brand)
+                        _has_signal = bool(
+                            _q_attrs.get('laptop_family')
+                            or _q_attrs.get('platform_code')
+                            or _q_attrs.get('model_code')
+                        )
+                        if input_brand and score < 75 and not _has_signal:
+                            no_match_reason = 'CATALOG_MISSING_LIKELY'
+                        else:
+                            # Has family/code signal OR score >= 75 — SKU
+                            # may exist but retrieval/gate blocked it.
+                            no_match_reason = 'RETRIEVAL_WEAK'
+                    elif method == 'none' and score == 0:
+                        no_match_reason = 'CATALOG_MISSING_LIKELY'
+                    elif score > 0 and score < threshold:
+                        no_match_reason = 'CATALOG_MISSING_LIKELY'
                     else:
                         no_match_reason = 'CATALOG_MISSING_LIKELY'
                 elif match_result.get('match_status') in (MATCH_STATUS_MATCHED, MATCH_STATUS_MULTIPLE):
@@ -4960,7 +5370,9 @@ def run_matching(
                 if match_result.get('match_status') == MATCH_STATUS_SUGGESTED:
                     method = match_result.get('method', '')
                     sel_reason = match_result.get('selection_reason', '')
-                    if 'fuzzy' in method:
+                    if 'retrieval_weak' in method:
+                        review_reason = 'RETRIEVAL_WEAK'
+                    elif 'fuzzy' in method:
                         review_reason = 'FUZZY_ONLY'
                     elif 'gate_blocked' in method:
                         review_reason = 'GATE_BLOCKED_SUSPICIOUS'
@@ -5787,6 +6199,36 @@ def parse_asset_sheets(file) -> Dict[str, Dict]:
             # Detect brand and name columns
             col_map = _detect_columns(raw_headers)
 
+            # --- URL-only CSV detection (e.g., Forza) ---
+            # If the detected name column has very low cardinality (few unique values
+            # vs total rows), it's likely a categorical field (grade, condition) rather
+            # than actual product names.  Synthesize product_name from URL column.
+            _url_col_name = None
+            for _c in raw_headers:
+                if _c.lower().strip() in ('url', 'product_url', 'link', 'href'):
+                    _url_col_name = _c
+                    break
+            if _url_col_name and col_map['name_col']:
+                _nunique = df[col_map['name_col']].nunique()
+                _total = max(len(df), 1)
+                if _nunique / _total < 0.1 and _nunique <= 10:
+                    # Name column is categorical → extract product names from URLs
+                    df['product_name'] = (
+                        df[_url_col_name]
+                        .apply(extract_name_from_url)
+                        .apply(_clean_url_extracted_name)
+                    )
+                    col_map['name_col'] = 'product_name'
+            # Also handle the case where no name column was detected at all
+            # but a URL column exists
+            if col_map['name_col'] is None and _url_col_name:
+                df['product_name'] = (
+                    df[_url_col_name]
+                    .apply(extract_name_from_url)
+                    .apply(_clean_url_extracted_name)
+                )
+                col_map['name_col'] = 'product_name'
+
             if col_map['name_col'] is None:
                 return results  # Can't match without a product name column
 
@@ -5845,6 +6287,30 @@ def parse_asset_sheets(file) -> Dict[str, Dict]:
 
             # Detect brand and name columns
             col_map = _detect_columns(raw_headers)
+
+            # --- URL-only sheet detection (same logic as CSV path) ---
+            _url_col_name = None
+            for _c in raw_headers:
+                if _c.lower().strip() in ('url', 'product_url', 'link', 'href'):
+                    _url_col_name = _c
+                    break
+            if _url_col_name and col_map['name_col']:
+                _nunique = df[col_map['name_col']].nunique()
+                _total = max(len(df), 1)
+                if _nunique / _total < 0.1 and _nunique <= 10:
+                    df['product_name'] = (
+                        df[_url_col_name]
+                        .apply(extract_name_from_url)
+                        .apply(_clean_url_extracted_name)
+                    )
+                    col_map['name_col'] = 'product_name'
+            if col_map['name_col'] is None and _url_col_name:
+                df['product_name'] = (
+                    df[_url_col_name]
+                    .apply(extract_name_from_url)
+                    .apply(_clean_url_extracted_name)
+                )
+                col_map['name_col'] = 'product_name'
 
             if col_map['name_col'] is None:
                 continue  # Can't match without a product name column
@@ -7265,6 +7731,229 @@ def self_test_verification() -> List[str]:
     if 's8 plus' not in _nt_tabs8:
         failures.append(f'FAIL: "Tab S8+" should normalize to "s8 plus" — got "{_nt_tabs8}"')
 
+    # =================================================================
+    # V2 LAPTOP NORMALIZATION TESTS (Task A / B / C)
+    # =================================================================
+
+    # 60. Screen size + TBT3 parentheses cleanup
+    _lnorm1 = normalize_laptop_query_text_v2('Apple MacBook Pro (13" 2020, 4 TBT3)')
+    if '13 inch' not in _lnorm1 or '2020' not in _lnorm1:
+        failures.append(
+            f'FAIL: Laptop norm — expected "13 inch" and "2020" in result, '
+            f'got "{_lnorm1}"')
+    if 'tbt' in _lnorm1.lower():
+        failures.append(
+            f'FAIL: Laptop norm — TBT3 should be removed, got "{_lnorm1}"')
+
+    # 61. Thunderbolt/Wi-Fi noise removed, CPU/storage/RAM kept
+    _lnorm2 = normalize_laptop_query_text_v2(
+        'HP EliteBook 840 G8 14" i5 Wi-Fi 6E Thunderbolt 16GB 512GB SSD')
+    _ln2_low = _lnorm2.lower()
+    if 'wi-fi' in _ln2_low or 'wifi' in _ln2_low or 'thunderbolt' in _ln2_low:
+        failures.append(
+            f'FAIL: Laptop norm — Wi-Fi/Thunderbolt should be removed, got "{_lnorm2}"')
+    for token in ('i5', '16gb', '512gb', 'elitebook', '840'):
+        if token not in _ln2_low:
+            failures.append(
+                f'FAIL: Laptop norm — identity token "{token}" lost, got "{_lnorm2}"')
+
+    # 62. Non-laptop text is NOT broken by laptop normalization
+    _lnorm3 = normalize_laptop_query_text_v2('Samsung Galaxy S24 Ultra 512GB')
+    if 'galaxy' not in _lnorm3.lower() or 's24' not in _lnorm3.lower():
+        failures.append(
+            f'FAIL: Laptop norm should not break non-laptop text — got "{_lnorm3}"')
+
+    # 63. Screen size with actual inch word preserved
+    _lnorm4 = normalize_laptop_query_text_v2('Dell Latitude 14 inch i7 16GB 512GB')
+    if '14 inch' not in _lnorm4.lower():
+        failures.append(
+            f'FAIL: Laptop norm — "14 inch" should be preserved, got "{_lnorm4}"')
+
+    # 64. Parentheses with only noise → fully removed
+    _lnorm5 = normalize_laptop_query_text_v2('MacBook Air (4 TBT3, Wi-Fi 6)')
+    if 'tbt' in _lnorm5.lower() or 'wi-fi' in _lnorm5.lower():
+        failures.append(
+            f'FAIL: Laptop norm — noise-only parens should be dropped, got "{_lnorm5}"')
+    if 'macbook air' not in _lnorm5.lower():
+        failures.append(
+            f'FAIL: Laptop norm — "MacBook Air" identity lost, got "{_lnorm5}"')
+
+    # 65. Laptop attribute extraction AFTER v2 normalization gets correct storage
+    _lq65 = normalize_laptop_query_text_v2(
+        'Apple MacBook Pro (13" 2020, 2 TBT3) - Core i5 / 8GB / 256GB SSD')
+    _la65 = extract_laptop_attributes(normalize_text(_lq65), 'apple')
+    if _la65.get('storage') != '256gb':
+        failures.append(
+            f'FAIL: Laptop v2 norm+extract storage — expected "256gb", '
+            f'got "{_la65.get("storage")}" (from "{_lq65}")')
+    if _la65.get('processor') != 'i5':
+        failures.append(
+            f'FAIL: Laptop v2 norm+extract processor — expected "i5", '
+            f'got "{_la65.get("processor")}"')
+
+    # 66. WLAN / BT / HDMI tokens removed
+    _lnorm6 = normalize_laptop_query_text_v2(
+        'Lenovo ThinkPad T14 i5 WLAN BT HDMI 16GB 256GB')
+    _ln6_low = _lnorm6.lower()
+    for noise in ('wlan', ' bt ', 'hdmi'):
+        if noise in _ln6_low:
+            failures.append(
+                f'FAIL: Laptop norm — "{noise.strip()}" should be removed, got "{_lnorm6}"')
+
+    # ==================== TASK 5: Policy-class + cross-join regression tests ====================
+
+    # 154. laptop_policy_class: MacBook Pro → APPLE_MACBOOK
+    _policy154 = laptop_policy_class('Apple MacBook Pro M2 16GB 512GB', 'Apple',
+                                     extract_laptop_attributes('Apple MacBook Pro M2 16GB 512GB', 'Apple'))
+    if _policy154 != 'APPLE_MACBOOK':
+        failures.append(f'FAIL: MacBook Pro policy should be APPLE_MACBOOK, got "{_policy154}"')
+
+    # 155. laptop_policy_class: Dell Latitude → WINDOWS_BUSINESS
+    _policy155 = laptop_policy_class('Dell Latitude 5420 Core i5 16GB 512GB', 'Dell',
+                                     extract_laptop_attributes('Dell Latitude 5420 Core i5 16GB 512GB', 'Dell'))
+    if _policy155 != 'WINDOWS_BUSINESS':
+        failures.append(f'FAIL: Dell Latitude policy should be WINDOWS_BUSINESS, got "{_policy155}"')
+
+    # 156. laptop_policy_class: ASUS ROG Strix → WINDOWS_GAMING
+    _policy156 = laptop_policy_class('ASUS ROG Strix G15 Core i7 16GB 512GB RTX 3060', 'ASUS',
+                                     extract_laptop_attributes('ASUS ROG Strix G15 Core i7 16GB 512GB RTX 3060', 'ASUS'))
+    if _policy156 != 'WINDOWS_GAMING':
+        failures.append(f'FAIL: ROG Strix policy should be WINDOWS_GAMING, got "{_policy156}"')
+
+    # 157. laptop_policy_class: Acer Aspire (no gaming) → WINDOWS_OTHER
+    _policy157 = laptop_policy_class('Acer Aspire 5 Core i5 8GB 256GB', 'Acer',
+                                     extract_laptop_attributes('Acer Aspire 5 Core i5 8GB 256GB', 'Acer'))
+    if _policy157 != 'WINDOWS_OTHER':
+        failures.append(f'FAIL: Acer Aspire policy should be WINDOWS_OTHER, got "{_policy157}"')
+
+    # 158. screen_inches extraction: "14 inch" → "14"
+    _si158 = extract_laptop_attributes('Dell Latitude 14 inch Core i5 16GB 512GB', 'Dell')
+    if _si158.get('screen_inches') != '14':
+        failures.append(f'FAIL: screen_inches should be "14", got "{_si158.get("screen_inches")}"')
+
+    # 159. apple_chip extraction: "M2 Pro" → "m2 pro"
+    _ac159 = extract_laptop_attributes('Apple MacBook Pro M2 Pro 16GB 512GB', 'Apple')
+    if _ac159.get('apple_chip') != 'm2 pro':
+        failures.append(f'FAIL: apple_chip should be "m2 pro", got "{_ac159.get("apple_chip")}"')
+
+    # 160. Dual-storage detection: "256GB + 1TB"
+    _ds160 = extract_laptop_attributes('Dell Latitude i5 16GB 256GB SSD 1TB HDD', 'Dell')
+    if not _ds160.get('storage_ambiguous'):
+        failures.append('FAIL: "256GB + 1TB" should set storage_ambiguous=True')
+    if sorted(_ds160.get('storage_list', [])) != [256, 1024]:
+        failures.append(f'FAIL: storage_list should be [256, 1024], got {_ds160.get("storage_list")}')
+
+    # 161. Dual-storage query → always REVIEW_REQUIRED (never MATCHED)
+    _nl161 = ['dell latitude core i5 gen11 16gb 256gb ssd']
+    _lu161 = {_nl161[0]: ['NL-DUAL-161']}
+    _r161 = match_laptop_by_attributes(
+        'dell latitude core i5 gen11 16gb 256gb ssd 1tb hdd',
+        'dell', 'Dell Latitude Core i5 11th Gen 16GB 256GB SSD 1TB HDD',
+        _nl161, _lu161, None)
+    if _r161 is not None and _r161.get('match_status') == MATCH_STATUS_MATCHED:
+        failures.append('FAIL: Dual-storage laptop query should never be MATCHED')
+
+    # 162. MacBook Pro 16" must NOT match MacBook Pro 14" (screen mismatch via scoring)
+    _nl162_14 = 'apple macbook pro 14 inch m2 pro 16gb 512gb ssd'
+    _nl162_16 = 'apple macbook pro 16 inch m2 pro 16gb 512gb ssd'
+    _nl162 = [_nl162_14, _nl162_16]
+    _lu162 = {_nl162_14: ['NL-MBP14'], _nl162_16: ['NL-MBP16']}
+    _r162 = match_laptop_by_attributes(
+        'apple macbook pro 16 inch m2 pro 16gb 512gb ssd',
+        'apple', 'Apple MacBook Pro 16" M2 Pro 16GB 512GB',
+        _nl162, _lu162, None)
+    if _r162 is not None and _r162.get('match_status') == MATCH_STATUS_MATCHED:
+        if _r162.get('mapped_uae_assetid') == 'NL-MBP14':
+            failures.append('FAIL: MacBook Pro 16" should NOT match 14" as MATCHED')
+
+    # 163. MacBook Air 15" must NOT match MacBook Air 13" as MATCHED
+    _nl163_13 = 'apple macbook air 13 inch m2 8gb 256gb ssd'
+    _nl163_15 = 'apple macbook air 15 inch m2 8gb 256gb ssd'
+    _nl163 = [_nl163_13, _nl163_15]
+    _lu163 = {_nl163_13: ['NL-MBA13'], _nl163_15: ['NL-MBA15']}
+    _r163 = match_laptop_by_attributes(
+        'apple macbook air 15 inch m2 8gb 256gb ssd',
+        'apple', 'Apple MacBook Air 15" M2 8GB 256GB',
+        _nl163, _lu163, None)
+    if _r163 is not None and _r163.get('match_status') == MATCH_STATUS_MATCHED:
+        if _r163.get('mapped_uae_assetid') == 'NL-MBA13':
+            failures.append('FAIL: MacBook Air 15" should NOT match 13" as MATCHED')
+
+    # 164. Dell Latitude 7320 with missing CPU/RAM/storage → None (incomplete)
+    _nl164 = ['dell latitude 7320 core i5 gen11 16gb 512gb ssd']
+    _lu164 = {_nl164[0]: ['NL-LAT-7320']}
+    _r164 = match_laptop_by_attributes(
+        'dell latitude 7320',
+        'dell', 'Dell Latitude 7320',
+        _nl164, _lu164, None)
+    if _r164 is not None and _r164.get('match_status') == MATCH_STATUS_MATCHED:
+        failures.append('FAIL: Dell Latitude 7320 with no specs should not be MATCHED')
+
+    # 165. ROG Zephyrus should NOT match ROG Strix as MATCHED (family mismatch → skip)
+    _nl165_strix = 'asus rog strix g15 core i7 gen11 16gb 512gb ssd'
+    _nl165_zeph = 'asus rog zephyrus g14 ryzen 9 gen11 16gb 1024gb ssd'
+    _nl165 = [_nl165_strix, _nl165_zeph]
+    _lu165 = {_nl165_strix: ['NL-STRIX'], _nl165_zeph: ['NL-ZEPH']}
+    _r165 = match_laptop_by_attributes(
+        'asus rog zephyrus g14 core i7 gen11 16gb 512gb ssd',
+        'asus', 'ASUS ROG Zephyrus G14 Core i7 11th Gen 16GB 512GB',
+        _nl165, _lu165, None)
+    if _r165 is not None and _r165.get('match_status') == MATCH_STATUS_MATCHED:
+        if _r165.get('mapped_uae_assetid') == 'NL-STRIX':
+            failures.append('FAIL: ROG Zephyrus should NOT match ROG Strix as MATCHED')
+
+    # 166. Non-laptop categories unchanged: mobile matching still works
+    _q166 = extract_product_attributes('apple iphone 15 pro 256gb', 'apple')
+    _c166 = extract_product_attributes('apple iphone 15 pro 256gb', 'apple')
+    _pass166, _ = mobile_variant_exact_match(_q166, _c166)
+    if not _pass166:
+        failures.append('FAIL: iPhone 15 Pro should still match itself (non-laptop unchanged)')
+
+    # 167. Completeness gate: WINDOWS_BUSINESS without code/family → REVIEW
+    _nl167 = ['dell latitude core i5 gen11 16gb 512gb ssd']
+    _lu167 = {_nl167[0]: ['NL-BIZ-167']}
+    _r167 = match_laptop_by_attributes(
+        'dell latitude core i5 gen11 16gb 512gb ssd',
+        'dell', 'Dell Latitude Core i5 11th Gen 16GB 512GB',
+        _nl167, _lu167, None)
+    # This query has product_line=latitude but no platform_code or laptop_family
+    # → completeness gate should fail (missing code_or_family for WINDOWS_BUSINESS)
+    # It should NOT be MATCHED
+    if _r167 is not None and _r167.get('match_status') == MATCH_STATUS_MATCHED:
+        _q167_attrs = extract_laptop_attributes('dell latitude core i5 gen11 16gb 512gb ssd', 'dell')
+        _q167_fam = _q167_attrs.get('laptop_family', '')
+        _q167_pc = _q167_attrs.get('platform_code', '')
+        # Only fail if truly no disambiguator present
+        if not _q167_fam and not _q167_pc:
+            failures.append('FAIL: WINDOWS_BUSINESS without code/family should be REVIEW, not MATCHED')
+
+    # 168. Score margin test: two identical candidates → REVIEW (margin=0)
+    _nl168_a = 'hp elitebook 840 g8 core i5 gen11 16gb 512gb ssd'
+    _nl168_b = 'hp elitebook 840 g8 core i5 gen11 16gb 512gb ssd'
+    _nl168 = [_nl168_a]
+    _lu168 = {_nl168_a: ['NL-HP-A', 'NL-HP-B']}
+    _r168 = match_laptop_by_attributes(
+        'hp elitebook 840 g8 core i5 gen11 16gb 512gb ssd',
+        'hp', 'HP EliteBook 840 G8 Core i5 11th Gen 16GB 512GB',
+        _nl168, _lu168, None)
+    # Multi-ID with same name → goes to tie-break path
+    # Since both resolve to same NL name (no platform code differentiation in catalog),
+    # should be REVIEW (multi-ID)
+    if _r168 is not None and _r168.get('match_status') == MATCH_STATUS_MATCHED:
+        if len(_lu168[_nl168_a]) > 1:
+            failures.append('FAIL: Multi-ID with no tie-breaker should be REVIEW, not MATCHED')
+
+    # 169. Apple MacBook with only product_line + storage should still score (Apple entry gate)
+    _nl169 = ['apple macbook pro 16gb 512gb ssd']
+    _lu169 = {_nl169[0]: ['NL-MBP-169']}
+    _r169 = match_laptop_by_attributes(
+        'apple macbook pro 16gb 512gb ssd',
+        'apple', 'Apple MacBook Pro 16GB 512GB',
+        _nl169, _lu169, None)
+    # Should return *something* (not None) — Apple needs product_line + storage minimum
+    if _r169 is None:
+        failures.append('FAIL: MacBook Pro with storage should not return None from Apple gate')
+
     return failures
 
 
@@ -7757,6 +8446,86 @@ def generate_diagnostics_sheet(all_results: Dict[str, pd.DataFrame]) -> pd.DataF
                 diag_rows.append({
                     'section': 'catalog_missing_brand',
                     'key': str(brand),
+                    'value': str(cnt),
+                })
+
+    # ================================================================
+    # 7. LAPTOP DIAGNOSTICS (V2 Task D)
+    # ================================================================
+
+    laptop_df = combined[combined['category'].fillna('').str.lower() == 'laptop']
+    if len(laptop_df) > 0:
+        # 7a. Laptop: Top 20 CATALOG_MISSING / RETRIEVAL_WEAK group_keys
+        diag_rows.append({'section': '', 'key': '', 'value': ''})
+        diag_rows.append({'section': 'LAPTOP: TOP 20 CATALOG MISSING / RETRIEVAL_WEAK GROUP KEYS',
+                          'key': '', 'value': ''})
+        _nm_laptop = laptop_df[laptop_df['no_match_reason'].fillna('').isin(
+            ('CATALOG_MISSING_LIKELY', 'RETRIEVAL_WEAK'))]
+        if len(_nm_laptop) > 0:
+            _gkeys = []
+            for _, row in _nm_laptop.iterrows():
+                name = str(row.get('original_input', ''))
+                brand = ''
+                for bcol in ('Brand', 'brand', 'manufacturer'):
+                    if bcol in row.index and pd.notna(row.get(bcol)):
+                        brand = str(row[bcol]).strip()
+                        break
+                mfk = extract_model_family_key(name, 'laptop', brand_hint=brand)
+                if not mfk:
+                    nb = normalize_brand(brand) or brand.lower()
+                    ct = normalize_text(name)
+                    ft = ' '.join(ct.split()[:4]) if ct else ''
+                    mfk = f'{nb}:{ft}' if ft else nb
+                _gkeys.append(mfk)
+            _nm_laptop = _nm_laptop.copy()
+            _nm_laptop['_diag_gk'] = _gkeys
+            for gk, cnt in _nm_laptop['_diag_gk'].value_counts().head(20).items():
+                examples = _nm_laptop[_nm_laptop['_diag_gk'] == gk]['original_input'].unique()[:2].tolist()
+                diag_rows.append({
+                    'section': 'laptop_missing_gk',
+                    'key': str(gk),
+                    'value': f'{cnt} (e.g. {"; ".join(str(e)[:60] for e in examples)})',
+                })
+
+        # 7b. Laptop: Top 10 review_summary reasons
+        diag_rows.append({'section': '', 'key': '', 'value': ''})
+        diag_rows.append({'section': 'LAPTOP: TOP 10 REVIEW SUMMARY REASONS', 'key': '', 'value': ''})
+        _rev_laptop = laptop_df[laptop_df['match_status'] == MATCH_STATUS_SUGGESTED]
+        if len(_rev_laptop) > 0 and 'review_summary' in _rev_laptop.columns:
+            for reason, cnt in _rev_laptop['review_summary'].fillna('').value_counts().head(10).items():
+                if reason:
+                    diag_rows.append({
+                        'section': 'laptop_review_summary',
+                        'key': str(reason)[:80],
+                        'value': str(cnt),
+                    })
+
+        # 7c. Laptop: Top 10 "near miss" gate-block attributes
+        diag_rows.append({'section': '', 'key': '', 'value': ''})
+        diag_rows.append({'section': 'LAPTOP: TOP 10 NEAR-MISS GATE REASONS', 'key': '', 'value': ''})
+        if 'verification_reasons' in laptop_df.columns:
+            _vr = laptop_df[laptop_df['verification_reasons'].fillna('').str.len() > 0]['verification_reasons']
+            _reason_counts = {}
+            for reasons_str in _vr:
+                for r in str(reasons_str).split('; '):
+                    r = r.strip()
+                    if r and r.startswith('laptop_'):
+                        _reason_counts[r] = _reason_counts.get(r, 0) + 1
+            for reason, cnt in sorted(_reason_counts.items(), key=lambda x: -x[1])[:10]:
+                diag_rows.append({
+                    'section': 'laptop_gate_reason',
+                    'key': reason,
+                    'value': str(cnt),
+                })
+
+        # 7d. Laptop: no_match_reason breakdown
+        diag_rows.append({'section': '', 'key': '', 'value': ''})
+        diag_rows.append({'section': 'LAPTOP: NO_MATCH_REASON BREAKDOWN', 'key': '', 'value': ''})
+        if 'no_match_reason' in laptop_df.columns:
+            for reason, cnt in laptop_df['no_match_reason'].value_counts().items():
+                diag_rows.append({
+                    'section': 'laptop_no_match_reason',
+                    'key': str(reason),
                     'value': str(cnt),
                 })
 
