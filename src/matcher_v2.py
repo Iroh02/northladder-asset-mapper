@@ -12,7 +12,7 @@ Threshold / Confidence Tiers:
     - >= 95%: HIGH confidence (auto-accept) — safe to apply UAE Asset ID directly
     - 85-94%: MEDIUM confidence (REVIEW_REQUIRED) — needs human review, shows top candidates
     - < 85%:  LOW confidence (NO_MATCH) — manual mapping required
-    - The 85-94% zone contains false positives (e.g., iPhone 4 → iPhone 6 at 95%)
+    - The 85-94% zone contains false positives (e.g., iPhone 4 -> iPhone 6 at 95%)
       so these are flagged for review rather than auto-accepted
 
 Duplicate Handling:
@@ -103,12 +103,12 @@ BRAND_ALIASES: Dict[str, str] = {
     'realme mobile': 'realme',
     # Nothing variants
     'nothing technology': 'nothing',
-    # NL catalog OLD/New brand splits → canonical brand
+    # NL catalog OLD/New brand splits -> canonical brand
     'dell old': 'dell', 'dell new': 'dell',
     'hp old': 'hp', 'hp new': 'hp',
     'lenovo old': 'lenovo', 'lenovo new': 'lenovo',
     'samsung (old)': 'samsung',
-    # NL sub-brands → parent brand
+    # NL sub-brands -> parent brand
     'legion': 'lenovo', 'omen': 'hp', 'alienware': 'dell',
     'macbooks': 'apple',
     # MSI alias
@@ -149,7 +149,7 @@ def normalize_brand(brand: str) -> str:
     return b_stripped if b_stripped else b
 
 
-# Known brand names for inference (canonical → itself, for first-word lookup)
+# Known brand names for inference (canonical -> itself, for first-word lookup)
 _KNOWN_BRANDS = {
     'apple', 'samsung', 'huawei', 'xiaomi', 'oppo', 'vivo', 'realme',
     'oneplus', 'motorola', 'nokia', 'honor', 'google', 'sony', 'lg',
@@ -157,7 +157,7 @@ _KNOWN_BRANDS = {
     'poco', 'tecno', 'infinix', 'itel', 'zte', 'alcatel', 'meizu',
     'blackberry', 'htc', 'nubia', 'iqoo',
 }
-# Also build reverse lookup: all alias keys → canonical brand
+# Also build reverse lookup: all alias keys -> canonical brand
 _BRAND_FROM_FIRST_WORD = {b: b for b in _KNOWN_BRANDS}
 for alias, canonical in BRAND_ALIASES.items():
     first = alias.split()[0]
@@ -220,7 +220,7 @@ def _infer_brand_from_name(product_name: str) -> str:
         if two_words in _BRAND_FROM_FIRST_WORD:
             return _BRAND_FROM_FIRST_WORD[two_words]
     # Try stripping trailing digits from first word for product-line matching
-    # Handles "reno4" → "reno" → oppo, "galaxy" stays "galaxy" (no digits)
+    # Handles "reno4" -> "reno" -> oppo, "galaxy" stays "galaxy" (no digits)
     first_base = re.sub(r'\d+$', '', first)
     if first_base and first_base != first and first_base in _PRODUCT_LINE_TO_BRAND:
         return _PRODUCT_LINE_TO_BRAND[first_base]
@@ -228,15 +228,31 @@ def _infer_brand_from_name(product_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# URL → product name extraction
+# URL -> product name extraction
 # ---------------------------------------------------------------------------
 
 def _is_url(text: str) -> bool:
-    """Check if text looks like a URL."""
+    """Check if text looks like a URL.
+
+    Returns True for:
+        - Standard URLs:  http://..., https://..., www.…
+        - Protocol-relative: //example.com/path
+        - Bare domains:   example.com/path  (domain.tld followed by /)
+        - Embedded URLs:  "url: https://..." or "see https://..."
+    """
     if not isinstance(text, str):
         return False
     t = text.strip().lower()
-    return t.startswith(('http://', 'https://', 'www.'))
+    # Standard prefixes
+    if t.startswith(('http://', 'https://', 'www.', '//')):
+        return True
+    # Embedded URL anywhere in the text
+    if re.search(r'https?://', t):
+        return True
+    # Bare domain pattern: word.tld/  (e.g. "example.com/iphone-15")
+    if re.search(r'[a-z0-9][-a-z0-9]*\.[a-z]{2,}/', t):
+        return True
+    return False
 
 
 def extract_name_from_url(url: str) -> str:
@@ -244,35 +260,77 @@ def extract_name_from_url(url: str) -> str:
     Extract a human-readable product name from a product page URL.
 
     Handles common e-commerce URL patterns:
-        https://www.recommerce.com/fr/iphone-15-128go-bleu → 'iphone 15 128go bleu'
-        https://example.com/products/samsung-galaxy-s23-256gb → 'samsung galaxy s23 256gb'
+        https://www.recommerce.com/fr/iphone-15-128go-bleu -> 'iphone 15 128go bleu'
+        https://example.com/products/samsung-galaxy-s23-256gb -> 'samsung galaxy s23 256gb'
+
+    If the last path segment is too short, purely numeric, or looks like an
+    opaque ID, the function scans earlier segments and picks the best
+    slug-like candidate (contains both letters and digits, e.g.
+    "iphone-15-128gb").
+
+    Scheme-less URLs ("example.com/path", "//example.com/path") and
+    embedded URLs ("url: https://...") are accepted — a leading
+    "http(s)://" is prepended when missing so urlparse works correctly.
 
     Returns empty string if parsing fails or no meaningful name found.
     """
     if not isinstance(url, str) or not url.strip():
         return ''
     try:
-        parsed = urlparse(url.strip())
-        # Use the last meaningful path segment
+        raw = url.strip()
+
+        # --- normalise scheme-less / embedded URLs so urlparse works ---
+        # Embedded: "url: https://example.com/path" -> extract the URL part
+        _embedded = re.search(r'(https?://\S+)', raw)
+        if _embedded:
+            raw = _embedded.group(1)
+        # Protocol-relative: "//example.com/path"
+        elif raw.startswith('//'):
+            raw = 'https:' + raw
+        # Bare domain: "example.com/path" (no scheme, no //)
+        elif not raw.lower().startswith(('http://', 'https://')) and re.match(r'[a-z0-9][-a-z0-9]*\.[a-z]{2,}/', raw, re.IGNORECASE):
+            raw = 'https://' + raw
+
+        parsed = urlparse(raw)
         path = unquote(parsed.path).strip('/')
         if not path:
             return ''
-        # Take last segment (most specific), e.g., "iphone-15-128go-bleu"
-        slug = path.split('/')[-1]
-        # Remove common file extensions
-        slug = re.sub(r'\.(html?|php|aspx?|jsp)$', '', slug, flags=re.IGNORECASE)
-        # Remove query-like suffixes that leaked into the slug
-        slug = re.sub(r'[?#].*', '', slug)
-        # Replace hyphens/underscores with spaces
-        name = slug.replace('-', ' ').replace('_', ' ')
-        # Remove pure-numeric segments and UUIDs
-        name = re.sub(r'\b[0-9a-f]{8,}\b', '', name)
-        # Collapse whitespace
-        name = re.sub(r'\s+', ' ', name).strip()
-        # Reject if too short (likely not a product name)
-        if len(name) < 4:
-            return ''
-        return name
+
+        segments = path.split('/')
+
+        def _slug_to_name(slug: str) -> str:
+            """Convert a single URL slug to a candidate product name."""
+            slug = re.sub(r'\.(html?|php|aspx?|jsp)$', '', slug, flags=re.IGNORECASE)
+            slug = re.sub(r'[?#].*', '', slug)
+            name = slug.replace('-', ' ').replace('_', ' ')
+            name = re.sub(r'\b[0-9a-f]{8,}\b', '', name)
+            return re.sub(r'\s+', ' ', name).strip()
+
+        def _is_good_slug(name: str) -> bool:
+            """A good slug has both letters and digits (e.g. 'iphone 15 128gb')
+            and is at least 4 chars long."""
+            return (
+                len(name) >= 4
+                and bool(re.search(r'[a-zA-Z]', name))
+                and not re.fullmatch(r'[0-9]+', name)
+                and not re.fullmatch(r'[0-9a-f-]{20,}', name)  # UUID-ish
+            )
+
+        # Try last segment first (most specific)
+        best = _slug_to_name(segments[-1])
+        if _is_good_slug(best):
+            return best
+
+        # Fallback: scan all segments in reverse, pick the best slug-like one
+        for seg in reversed(segments[:-1]):
+            candidate = _slug_to_name(seg)
+            if _is_good_slug(candidate):
+                return candidate
+
+        # Final fallback: return whatever the last segment gave, if ≥4 chars
+        if len(best) >= 4:
+            return best
+        return ''
     except Exception:
         return ''
 
@@ -307,9 +365,9 @@ def strip_color_words(text: str) -> str:
     known color names. Does NOT strip substrings within product names.
 
     Examples:
-        'iPhone 15 128gb Bleu' → 'iPhone 15 128gb'
-        'iPhone Xs 64gb Gris Sideral' → 'iPhone Xs 64gb'
-        'iPhone 15 Pro 256gb' → 'iPhone 15 Pro 256gb' (unchanged)
+        'iPhone 15 128gb Bleu' -> 'iPhone 15 128gb'
+        'iPhone Xs 64gb Gris Sideral' -> 'iPhone Xs 64gb'
+        'iPhone 15 Pro 256gb' -> 'iPhone 15 Pro 256gb' (unchanged)
     """
     if not isinstance(text, str):
         return text
@@ -336,10 +394,10 @@ def _clean_url_extracted_name(text: str) -> str:
     Also handles trailing URL dedup digits on noise tokens (e.g., "titanium1", "sim1").
 
     Examples:
-        'iphone 14 pro 256gb paars nano' → 'iphone 14 pro 256gb'
-        'samsung galaxy s23 5g 256gb zwart dual sim' → 'samsung galaxy s23 5g 256gb'
-        'iphone 15 256gb black eu a grade' → 'iphone 15 256gb'
-        'iphone 16 pro 256 gb titanium1' → 'iphone 16 pro 256 gb'
+        'iphone 14 pro 256gb paars nano' -> 'iphone 14 pro 256gb'
+        'samsung galaxy s23 5g 256gb zwart dual sim' -> 'samsung galaxy s23 5g 256gb'
+        'iphone 15 256gb black eu a grade' -> 'iphone 15 256gb'
+        'iphone 16 pro 256 gb titanium1' -> 'iphone 16 pro 256 gb'
     """
     if not isinstance(text, str):
         return text
@@ -353,12 +411,12 @@ def _clean_url_extracted_name(text: str) -> str:
         wl = w.lower()
         if wl in noise:
             continue
-        # Strip trailing digits from URL dedup suffixes (e.g., "titanium1" → "titanium")
+        # Strip trailing digits from URL dedup suffixes (e.g., "titanium1" -> "titanium")
         wl_stripped = re.sub(r'\d+$', '', wl)
         if wl_stripped and wl_stripped in noise:
             continue
         filtered.append(w)
-    # Remove trailing standalone single digits (URL dedup: "...paars-1" → "...1")
+    # Remove trailing standalone single digits (URL dedup: "...paars-1" -> "...1")
     while filtered and re.fullmatch(r'\d{1,2}', filtered[-1]):
         filtered.pop()
     return ' '.join(filtered).strip()
@@ -380,14 +438,14 @@ def normalize_text(text: str) -> str:
         4. Keep letter suffixes on models (7X vs 7C) - different variants
         5. Keep product type keywords (Tab, Watch, Fold) - different categories
         6. Remove punctuation (commas, quotes, dashes become spaces)
-        7. Standardize storage/RAM: "16 gb" → "16gb"
+        7. Standardize storage/RAM: "16 gb" -> "16gb"
         8. Remove connectivity markers (5G/LTE) - not product differentiators
         9. Collapse whitespace
 
     Variant preservation prevents false MULTIPLE_MATCHES:
-    - iPhone 11 Pro vs Pro Max → different normalized names (different products!)
-    - Honor 7 vs 7X → different normalized names (different models!)
-    - Galaxy Tab vs Watch → different normalized names (different categories!)
+    - iPhone 11 Pro vs Pro Max -> different normalized names (different products!)
+    - Honor 7 vs 7X -> different normalized names (different models!)
+    - Galaxy Tab vs Watch -> different normalized names (different categories!)
 
     Safety note: We intentionally keep:
     - All numeric tokens (storage, RAM, model numbers, years)
@@ -403,16 +461,16 @@ def normalize_text(text: str) -> str:
     # --- Generation / edition normalization ---
     # Normalize "mark ii", "mk2", "mk 2", "gen 2", "2nd gen", "2nd generation"
     # to canonical "mk2" / "gen2" forms BEFORE punctuation removal
-    # Roman numerals: I→1, II→2, III→3, IV→4, V→5, VI→6, VII→7, VIII→8, IX→9, X→10
+    # Roman numerals: I->1, II->2, III->3, IV->4, V->5, VI->6, VII->7, VIII->8, IX->9, X->10
     _roman_map = {'i': '1', 'ii': '2', 'iii': '3', 'iv': '4', 'v': '5',
                   'vi': '6', 'vii': '7', 'viii': '8', 'ix': '9', 'x': '10'}
-    # "mark ii" / "mark 2" → "mk2"
+    # "mark ii" / "mark 2" -> "mk2"
     def _replace_mark(m):
         val = m.group(1).strip().lower()
-        num = _roman_map.get(val, val)  # roman → digit, or keep digit
+        num = _roman_map.get(val, val)  # roman -> digit, or keep digit
         return f'mk{num}'
     s = re.sub(r'\b(?:mark|mk)\s*(i{1,3}v?|vi{0,3}|ix|x|\d+)\b', _replace_mark, s, flags=re.IGNORECASE)
-    # "gen 2" / "gen ii" / "2nd gen" / "2nd generation" → "gen2"
+    # "gen 2" / "gen ii" / "2nd gen" / "2nd generation" -> "gen2"
     def _replace_gen_forward(m):
         val = m.group(1).strip().lower()
         num = _roman_map.get(val, val)
@@ -421,7 +479,7 @@ def normalize_text(text: str) -> str:
         val = m.group(1).strip().lower()
         num = re.sub(r'(st|nd|rd|th)$', '', val)
         return f'gen{num}'
-    # Reverse pattern MUST run first: "7th gen 10.4" → "gen7 10.4" before forward
+    # Reverse pattern MUST run first: "7th gen 10.4" -> "gen7 10.4" before forward
     # pattern can greedily match "gen 10" from the screen size that follows
     s = re.sub(r'\b(\d+)(?:st|nd|rd|th)\s*gen(?:eration)?\b', _replace_gen_reverse, s, flags=re.IGNORECASE)
     s = re.sub(r'\bgen(?:eration)?\s*(i{1,3}v?|vi{0,3}|ix|x|\d+)\b', _replace_gen_forward, s, flags=re.IGNORECASE)
@@ -429,7 +487,7 @@ def normalize_text(text: str) -> str:
     # Brand canonicalization in text: collapse split brand names BEFORE model parsing
     s = re.sub(r'\bone\s+plus\b', 'oneplus', s)
 
-    # Samsung "+" variant normalization: "s24+" → "s24 plus", "a55+" → "a55 plus"
+    # Samsung "+" variant normalization: "s24+" -> "s24 plus", "a55+" -> "a55 plus"
     # Galaxy S/A series use "+" as shorthand for Plus (S24+, S25+, A55+, Tab S8+).
     # Must run BEFORE punctuation removal since '+' is not a word token.
     # Pattern: letter s/a followed by 1-2 digits, then '+'.
@@ -439,20 +497,20 @@ def normalize_text(text: str) -> str:
     # Model de-concatenation: split joined brand+model and variant patterns
     # Must happen early (before punctuation removal) but after lowercasing
     # Order matters: split compound variants first, then digit-based splits
-    # Pattern: variant combos joined together → split (must be before digit splits)
+    # Pattern: variant combos joined together -> split (must be before digit splits)
     s = re.sub(r'promax', 'pro max', s)
-    # Pattern: tab + model letter → add space (tabs8 → tab s8, taba7 → tab a7)
+    # Pattern: tab + model letter -> add space (tabs8 -> tab s8, taba7 -> tab a7)
     s = re.sub(r'\b(tab)([a-z]\d)', r'\1 \2', s)
-    # Pattern: known brand names directly followed by digits → add space
+    # Pattern: known brand names directly followed by digits -> add space
     s = re.sub(r'\b(iphone|ipad|galaxy|pixel|redmi|mate|nova|honor|poco|note|reno|find)(\d)', r'\1 \2', s)
-    # Pattern: digits directly followed by known variant keywords → add space
+    # Pattern: digits directly followed by known variant keywords -> add space
     s = re.sub(r'(\d)(pro|max|plus|ultra|lite|mini|se)\b', r'\1 \2', s)
 
     # --- Model concatenation: join separated model identifiers ---
-    # "fold 3" → "fold3", "flip 4" → "flip4"
+    # "fold 3" -> "fold3", "flip 4" -> "flip4"
     # These are single model identifiers that should stay together for token matching
     s = re.sub(r'\b(fold|flip)\s+(\d+)\b', r'\1\2', s)
-    # Galaxy S/A/Z series: "galaxy s 23" → "galaxy s23", "galaxy a 54" → "galaxy a54"
+    # Galaxy S/A/Z series: "galaxy s 23" -> "galaxy s23", "galaxy a 54" -> "galaxy a54"
     # Only in galaxy context to avoid false positives (e.g., "Moto Z 32 GB" or "Mate S 32 GB")
     s = re.sub(r'(galaxy)\s+([saz])\s+(\d{2})\b', r'\1 \2\3', s)
 
@@ -462,7 +520,7 @@ def normalize_text(text: str) -> str:
     s = re.sub(r'\b(\d+)\s*tbt\d?\b', r'\1tbt', s, flags=re.IGNORECASE)
 
     # Pre-normalize fractional TB to GB BEFORE punctuation removal (dot matters here)
-    # "0.25tb" → "256gb", "0.5tb" → "512gb"
+    # "0.25tb" -> "256gb", "0.5tb" -> "512gb"
     s = re.sub(r'\b0\.25\s*tb\b', '256gb', s, flags=re.IGNORECASE)
     s = re.sub(r'\b0\.5\s*tb\b', '512gb', s, flags=re.IGNORECASE)
 
@@ -474,22 +532,22 @@ def normalize_text(text: str) -> str:
     # This converts "(2016)" to " 2016 " which keeps the year
     s = re.sub(r'[,\-\(\)"\'\/\.]', ' ', s)
 
-    # French storage units: "Go" (Giga-octets) → GB, "To" (Téra-octets) → TB
-    # "256 Go" → "256gb", "1 To" → "1tb" (common in French recommerce data)
+    # French storage units: "Go" (Giga-octets) -> GB, "To" (Téra-octets) -> TB
+    # "256 Go" -> "256gb", "1 To" -> "1tb" (common in French recommerce data)
     s = re.sub(r'(\d+)\s*go\b', r'\1gb', s, flags=re.IGNORECASE)
     s = re.sub(r'(\d+)\s*to\b', r'\1tb', s, flags=re.IGNORECASE)
 
-    # Fix missing unit: "256g" → "256gb" (common typo in some datasets)
+    # Fix missing unit: "256g" -> "256gb" (common typo in some datasets)
     # Only convert true storage sizes (64g, 128g, 256g, 512g, 1024g, 2048g)
     # Do NOT convert small numbers like 16g/20g (MacBook GPU cores like 14c/20g)
     # Safe rule: only convert when number is >=64 OR has 3+ digits
     s = re.sub(r'\b(6[4-9]|[7-9]\d|\d{3,})g\b', r'\1gb', s, flags=re.IGNORECASE)
 
-    # Standardize storage/RAM: "16 gb" → "16gb", handles TB/MB too
+    # Standardize storage/RAM: "16 gb" -> "16gb", handles TB/MB too
     # This keeps RAM values distinct: "2gb" vs "3gb" vs "4gb"
     s = re.sub(r'(\d+)\s*(gb|tb|mb)', r'\1\2', s, flags=re.IGNORECASE)
 
-    # Standardize watch case size: "40 mm" → "40mm"
+    # Standardize watch case size: "40 mm" -> "40mm"
     # Critical for watch matching: 42mm vs 46mm are DIFFERENT products
     s = re.sub(r'(\d+)\s*mm\b', r'\1mm', s, flags=re.IGNORECASE)
 
@@ -530,7 +588,7 @@ def build_match_string(brand: str, name: str) -> str:
     brand_str = str(brand).strip() if pd.notna(brand) else ""
     name_str = str(name).strip() if pd.notna(name) else ""
 
-    # Normalize brand to canonical form: "HP OLD" → "hp", "Dell Inc" → "dell"
+    # Normalize brand to canonical form: "HP OLD" -> "hp", "Dell Inc" -> "dell"
     # Removes catalog noise ("OLD"/"New") and legal suffixes before combining.
     if brand_str:
         brand_canonical = normalize_brand(brand_str)
@@ -555,7 +613,7 @@ def build_match_string(brand: str, name: str) -> str:
 def extract_cpu_generation(text: str) -> str:
     """
     Extract CPU generation from laptop specs.
-    Maps CPU model codes to generation numbers (e.g., i5-12500H → 12th gen).
+    Maps CPU model codes to generation numbers (e.g., i5-12500H -> 12th gen).
     """
     text_lower = text.lower()
 
@@ -592,7 +650,7 @@ def extract_cpu_generation(text: str) -> str:
     if gen_match:
         return f"{gen_match.group(1)}th gen"
 
-    # Normalized text fallback: "gen8", "gen11" (from normalize_text converting "8th gen" → "gen8")
+    # Normalized text fallback: "gen8", "gen11" (from normalize_text converting "8th gen" -> "gen8")
     gen_norm_match = re.search(r'\bgen(\d{1,2})\b', text_lower)
     if gen_norm_match:
         return f"{gen_norm_match.group(1)}th gen"
@@ -702,7 +760,7 @@ _LAPTOP_NOISE_TOKENS = re.compile(
     re.IGNORECASE,
 )
 
-# Screen size with quote/inch symbol → "NN inch"
+# Screen size with quote/inch symbol -> "NN inch"
 _SCREEN_SIZE_QUOTE = re.compile(r'(\d+\.?\d*)\s*[""″\u201c\u201d]')
 _SCREEN_SIZE_INCH = re.compile(r'(\d+\.?\d*)\s*inch(?:es)?\b', re.IGNORECASE)
 
@@ -715,22 +773,22 @@ def normalize_laptop_query_text_v2(text: str) -> str:
     (brand, family, CPU, RAM, storage, year, chip).
 
     Examples:
-        'MacBook Pro (13" 2020, 4 TBT3)' → 'MacBook Pro 13 inch 2020'
+        'MacBook Pro (13" 2020, 4 TBT3)' -> 'MacBook Pro 13 inch 2020'
         'HP EliteBook 840 G8 14" i5 Wi-Fi 6E 16GB 512GB'
-            → 'HP EliteBook 840 G8 14 inch i5 16GB 512GB'
+            -> 'HP EliteBook 840 G8 14 inch i5 16GB 512GB'
     """
     if not text:
         return text
 
     s = str(text)
 
-    # 1. Normalize screen size: 13" → 13 inch, 15.6" → 15.6 inch
+    # 1. Normalize screen size: 13" -> 13 inch, 15.6" -> 15.6 inch
     s = _SCREEN_SIZE_QUOTE.sub(r'\1 inch', s)
     # Ensure existing "inch" forms are canonical
     s = _SCREEN_SIZE_INCH.sub(r'\1 inch', s)
 
     # 2. Parentheses cleanup: extract identity fragments, drop noise.
-    #    "(13 inch 2020, 4 TBT3)" → keep "13 inch 2020", drop "4 TBT3"
+    #    "(13 inch 2020, 4 TBT3)" -> keep "13 inch 2020", drop "4 TBT3"
     def _clean_parens(m):
         inner = m.group(1)
         # Split on comma; keep fragments with identity tokens
@@ -763,7 +821,7 @@ def extract_laptop_attributes(text: str, brand: str) -> Dict[str, str]:
     """
     text_norm = normalize_text(text)
     # Use normalize_brand (not normalize_text) so attrs['brand'] matches
-    # build_attribute_index keys — "HP OLD" → "hp", "Dell Inc" → "dell"
+    # build_attribute_index keys — "HP OLD" -> "hp", "Dell Inc" -> "dell"
     brand_norm = normalize_brand(brand) if brand else ''
     if not brand_norm:
         brand_norm = normalize_text(brand) if isinstance(brand, str) else ''
@@ -1009,7 +1067,7 @@ def extract_laptop_attributes(text: str, brand: str) -> Dict[str, str]:
     if brand_norm == 'acer':
         # Full Acer model code WITH suffix: sf314-57 or sf314 57 (hyphen or space)
         # The suffix distinguishes hardware revisions (SF314-57 != SF314-58)
-        # normalize_text strips hyphens → "sf314 57", raw text keeps "sf314-57"
+        # normalize_text strips hyphens -> "sf314 57", raw text keeps "sf314-57"
         _mc_m = re.search(r'\b([a-z]{2}\d{3})[-\s](\d{1,3}[a-z]*)\b', text_lower)
         if _mc_m:
             # Normalize to hyphen form: "sf314-57" regardless of separator
@@ -1083,7 +1141,7 @@ def extract_laptop_attributes(text: str, brand: str) -> Dict[str, str]:
                     attrs['platform_code'] = _pc_m.group(1)
 
     # --- Disambiguate product revision vs CPU generation ---
-    # "ThinkPad T14 Gen 3" → "Gen 3" is the 3rd revision of the T14, NOT Intel 3rd gen.
+    # "ThinkPad T14 Gen 3" -> "Gen 3" is the 3rd revision of the T14, NOT Intel 3rd gen.
     # If platform_code exists and "genX" appears right after it, cpu_gen was
     # misidentified as a product revision. Re-extract from CPU model number only,
     # or clear it if no CPU model number found.
@@ -1211,7 +1269,7 @@ def extract_watch_edition(text_norm: str) -> str:
 
 def extract_tablet_generation(text_norm: str) -> str:
     """
-    Extract iPad / tablet generation from text: '7th gen' → '7', 'gen5' → '5'.
+    Extract iPad / tablet generation from text: '7th gen' -> '7', 'gen5' -> '5'.
     Only matches ordinal-gen patterns — cannot affect phones/watches/laptops.
     """
     if not isinstance(text_norm, str):
@@ -1221,7 +1279,7 @@ def extract_tablet_generation(text_norm: str) -> str:
     m = re.search(r'(\d+)(?:st|nd|rd|th)\s*gen', t)
     if m:
         return m.group(1)
-    # normalize_text already converts "7th generation" → "gen7", "gen 5" → "gen5"
+    # normalize_text already converts "7th generation" -> "gen7", "gen 5" -> "gen5"
     m2 = re.search(r'\bgen(\d+)\b', t)
     if m2:
         return m2.group(1)
@@ -1230,15 +1288,15 @@ def extract_tablet_generation(text_norm: str) -> str:
 
 def extract_screen_inches(text_norm: str) -> str:
     """
-    Extract screen size in inches from text: '8.3"' → '8.3', '10.4 inch' → '10.4'.
-    Also handles normalize_text output where dots become spaces: '10 4' → '10.4'.
+    Extract screen size in inches from text: '8.3"' -> '8.3', '10.4 inch' -> '10.4'.
+    Also handles normalize_text output where dots become spaces: '10 4' -> '10.4'.
     Only returns plausible tablet/laptop screen sizes (7–15 inches).
     """
     if not isinstance(text_norm, str):
         return ''
     t = text_norm.lower()
-    # Space-separated decimal + inch suffix: "7 9 inch" → "7.9" (must run BEFORE simple inch match)
-    # This handles normalize_text converting "7.9 inch" → "7 9 inch"
+    # Space-separated decimal + inch suffix: "7 9 inch" -> "7.9" (must run BEFORE simple inch match)
+    # This handles normalize_text converting "7.9 inch" -> "7 9 inch"
     m_sp_inch = re.search(r'(?<!gen)(?<!\d)\b(\d{1,2})\s(\d)\s*(?:"|inch)', t)
     if m_sp_inch:
         reconstructed = f'{m_sp_inch.group(1)}.{m_sp_inch.group(2)}'
@@ -1257,7 +1315,7 @@ def extract_screen_inches(text_norm: str) -> str:
         val = float(m2.group(1))
         if 7.0 <= val <= 15.0:
             return m2.group(1)
-    # Space-separated decimal without suffix: "10 4" → "10.4", "8 3" → "8.3"
+    # Space-separated decimal without suffix: "10 4" -> "10.4", "8 3" -> "8.3"
     # Negative lookbehind prevents matching "gen7 8" as "7.8" (gen prefix = generation, not screen)
     m3 = re.search(r'(?<!gen)(?<!\d)\b(\d{1,2})\s(\d)\b', t)
     if m3:
@@ -1379,7 +1437,7 @@ def extract_product_attributes(text: str, brand: str = '') -> Dict[str, str]:
         # Also populate screen_inches from the canonical extractor
         tablet_attrs['screen_inches'] = extract_screen_inches(text_norm)
 
-        # Extract tablet generation: "7th gen" → "7", "gen5" → "5"
+        # Extract tablet generation: "7th gen" -> "7", "gen5" -> "5"
         tablet_attrs['generation'] = extract_tablet_generation(text_norm)
 
         # Extract year
@@ -1396,7 +1454,7 @@ def extract_product_attributes(text: str, brand: str = '') -> Dict[str, str]:
         if tl_m:
             tablet_attrs['tablet_line'] = tl_m.group(1)
 
-        # Connectivity: wifi vs cellular (lte/5g/cellular → "cellular", wifi-only → "wifi")
+        # Connectivity: wifi vs cellular (lte/5g/cellular -> "cellular", wifi-only -> "wifi")
         # Check both text_norm and text_orig (normalize_text strips "lte")
         _conn_text = f'{text_norm} {text_orig}'
         if re.search(r'\b(?:cellular|lte|5g|4g)\b', _conn_text):
@@ -1537,7 +1595,7 @@ def extract_product_attributes(text: str, brand: str = '') -> Dict[str, str]:
         text_clean = re.sub(r'\b(?:sm-)?[a-z]\d{3,5}[a-z]?\b', '', text_norm, flags=re.IGNORECASE)
         text_norm = re.sub(r'\s+', ' ', text_clean).strip()
 
-    # Apple iPhone: "iphone 14 pro 256gb" → line=iphone, model=14 pro
+    # Apple iPhone: "iphone 14 pro 256gb" -> line=iphone, model=14 pro
     # CRITICAL: Capture ALL variant words (pro max, pro, plus, mini, etc.)
     if 'iphone' in text_norm:
         match = re.search(r'iphone\s+(\d+[a-z]*(?:\s+(?:pro|plus|max|mini|ultra|lite))*)', text_norm)
@@ -1546,7 +1604,7 @@ def extract_product_attributes(text: str, brand: str = '') -> Dict[str, str]:
             attrs['model'] = match.group(1).strip()
             return _finalize_mobile_attrs(attrs)
 
-    # Samsung Galaxy: "galaxy s9 plus 128gb" → line=galaxy, model=s9 plus
+    # Samsung Galaxy: "galaxy s9 plus 128gb" -> line=galaxy, model=s9 plus
     # CRITICAL: Capture ALL variant words (plus, ultra, note, fold, flip, edge, active)
     # Also handle "galaxy z fold5", "galaxy z flip5" where model is "z fold5" / "z flip5"
     if 'galaxy' in text_norm:
@@ -1563,7 +1621,7 @@ def extract_product_attributes(text: str, brand: str = '') -> Dict[str, str]:
             attrs['model'] = match.group(1).strip()
             return _finalize_mobile_attrs(attrs)
 
-    # Google Pixel: "pixel 9 pro 256gb", "pixel 9 pro fold" → line=pixel, model=9 pro / 9 pro fold
+    # Google Pixel: "pixel 9 pro 256gb", "pixel 9 pro fold" -> line=pixel, model=9 pro / 9 pro fold
     # CRITICAL: Capture ALL variant words including fold (pro xl, pro fold, fold, pro, a, etc.)
     if 'pixel' in text_norm:
         match = re.search(r'pixel\s+(\d+[a-z]*(?:\s+(?:pro\s+fold|pro\s+xl|fold|pro|xl|max|ultra|lite|a))*)', text_norm)
@@ -1572,7 +1630,7 @@ def extract_product_attributes(text: str, brand: str = '') -> Dict[str, str]:
             attrs['model'] = match.group(1).strip()
             return _finalize_mobile_attrs(attrs)
 
-    # Xiaomi Redmi/Mi/Xiaomi-numbered: "redmi note 12 pro 128gb" → line=redmi, model=note 12 pro
+    # Xiaomi Redmi/Mi/Xiaomi-numbered: "redmi note 12 pro 128gb" -> line=redmi, model=note 12 pro
     # CRITICAL: Capture ALL variant words (pro max, pro, plus, etc.)
     if 'redmi' in text_norm:
         match = re.search(r'redmi\s+(note\s+\d+[a-z]*(?:\s+(?:pro|plus|max|ultra|lite))*|\d+[a-z]*(?:\s+(?:pro|plus|max|ultra|lite))*)', text_norm, re.IGNORECASE)
@@ -1581,7 +1639,7 @@ def extract_product_attributes(text: str, brand: str = '') -> Dict[str, str]:
             attrs['model'] = match.group(1).strip()
             return _finalize_mobile_attrs(attrs)
     elif 'xiaomi' in brand_norm or 'xiaomi' in text_norm:
-        # Xiaomi Mi series: "xiaomi mi 11 ultra" → line=mi, model=11 ultra
+        # Xiaomi Mi series: "xiaomi mi 11 ultra" -> line=mi, model=11 ultra
         # Use word-boundary \bmi\b to avoid matching substring of "xiaomi"
         if re.search(r'\bmi\b', text_norm):
             match = re.search(r'\bmi\s+(\d+[a-z]*(?:\s+(?:pro|plus|max|ultra|lite))*)', text_norm)
@@ -1589,14 +1647,14 @@ def extract_product_attributes(text: str, brand: str = '') -> Dict[str, str]:
                 attrs['product_line'] = 'mi'
                 attrs['model'] = match.group(1).strip()
                 return _finalize_mobile_attrs(attrs)
-        # Xiaomi numbered series: "xiaomi 15 ultra" → line=xiaomi, model=15 ultra
+        # Xiaomi numbered series: "xiaomi 15 ultra" -> line=xiaomi, model=15 ultra
         match = re.search(r'xiaomi\s+(\d+[a-z]*(?:\s+(?:pro|plus|max|ultra|lite|t))*)', text_norm)
         if match:
             attrs['product_line'] = 'xiaomi'
             attrs['model'] = match.group(1).strip()
             return _finalize_mobile_attrs(attrs)
 
-    # Huawei Mate/P-series: "mate 30 pro 256gb" → line=mate, model=30 pro
+    # Huawei Mate/P-series: "mate 30 pro 256gb" -> line=mate, model=30 pro
     # CRITICAL: Capture ALL variant words
     if 'mate' in text_norm and ('huawei' in brand_norm or 'huawei' in text_norm):
         match = re.search(r'mate\s+(\d+[a-z]*(?:\s+(?:pro|plus|max|ultra|lite))*)', text_norm)
@@ -1605,7 +1663,7 @@ def extract_product_attributes(text: str, brand: str = '') -> Dict[str, str]:
             attrs['model'] = match.group(1).strip()
             return _finalize_mobile_attrs(attrs)
     elif ('huawei' in brand_norm or 'huawei' in text_norm) and re.search(r'\bp\d+', text_norm):
-        # "huawei p30 pro" → line=p, model=30 pro
+        # "huawei p30 pro" -> line=p, model=30 pro
         match = re.search(r'p(\d+[a-z]*(?:\s+(?:pro|plus|max|ultra|lite))*)', text_norm)
         if match:
             attrs['product_line'] = 'p'
@@ -1668,10 +1726,10 @@ def build_attribute_index(df_nl_clean: pd.DataFrame) -> Dict:
     """
     Build an attribute-based index for fast exact matching.
 
-    Returns nested dict: brand → product_line → model → ram_storage_key → [asset_ids]
+    Returns nested dict: brand -> product_line -> model -> ram_storage_key -> [asset_ids]
 
-    For phones: brand → product_line → model → storage
-    For laptops: brand → product_line → model (CPU gen) → "ram_storage" (combined key)
+    For phones: brand -> product_line -> model -> storage
+    For laptops: brand -> product_line -> model (CPU gen) -> "ram_storage" (combined key)
 
     This allows O(1) lookup for products with clear attributes, avoiding
     expensive fuzzy matching for the majority of queries.
@@ -1869,10 +1927,10 @@ def try_attribute_match(
 
             # STRICT MATERIAL ENFORCEMENT
             if query_material:
-                # Query specifies material → DO NOT allow fallback
+                # Query specifies material -> DO NOT allow fallback
                 return None
 
-            # Query has no material → fallback allowed
+            # Query has no material -> fallback allowed
             fallback_keys = []
             if connectivity:
                 fallback_keys.append(f"{watch_mm}_{connectivity}")
@@ -1991,7 +2049,7 @@ def try_attribute_match(
                     'alternatives': [],
                 }
 
-        # --- TIER 2: Query has no storage → model has exactly 1 storage variant ---
+        # --- TIER 2: Query has no storage -> model has exactly 1 storage variant ---
         # Safe: If there's only one option, the product identity is unambiguous
         query_storage = attrs.get('storage', '')
         if not query_storage and model_data and attrs['product_line'] != 'watch':
@@ -2068,7 +2126,7 @@ def try_attribute_match(
                             'alternatives': [],
                         }
 
-        # --- TIER 3: Query has storage but no exact key → fuzzy match storage keys ---
+        # --- TIER 3: Query has storage but no exact key -> fuzzy match storage keys ---
         # SAFETY: For composite keys (ram_storage), RAM must match exactly.
         # Only the storage portion is allowed to fuzzy-match.
         if query_storage and model_data and attrs['product_line'] != 'watch':
@@ -2246,7 +2304,7 @@ def build_signature_index(df_nl_clean: pd.DataFrame) -> Dict[str, Dict]:
     For each row, extracts product attributes, builds a signature, and indexes it.
 
     Returns:
-        dict mapping signature → {
+        dict mapping signature -> {
             'asset_ids': [list of asset IDs],
             'nl_name': normalized name of first entry
         }
@@ -2446,7 +2504,7 @@ def load_and_clean_nl_list(df_nl: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
 
 def build_nl_lookup(df_nl_clean: pd.DataFrame) -> Dict[str, List[str]]:
     """
-    Build a lookup dictionary: normalized_name → list of uae_assetid values.
+    Build a lookup dictionary: normalized_name -> list of uae_assetid values.
 
     This handles the duplicate case: if multiple rows have the same normalized name,
     all their IDs are collected together.
@@ -2466,8 +2524,8 @@ def build_brand_index(df_nl_clean: pd.DataFrame) -> Dict[str, Dict]:
     """
     Build a brand-partitioned index for recursive matching.
 
-    Returns dict:  normalized_brand → {
-        'lookup': {normalized_name → [asset_ids]},
+    Returns dict:  normalized_brand -> {
+        'lookup': {normalized_name -> [asset_ids]},
         'names':  [list of normalized names],
     }
 
@@ -2497,7 +2555,7 @@ def build_brand_index(df_nl_clean: pd.DataFrame) -> Dict[str, Dict]:
 
 
 def _normalize_storage_value(val: str) -> str:
-    """Canonicalize storage: 1024gb→1tb, 2048gb→2tb. Passthrough for normal values."""
+    """Canonicalize storage: 1024gb->1tb, 2048gb->2tb. Passthrough for normal values."""
     if not val:
         return val
     m = re.match(r'^(\d+)(gb|tb|mb)$', val, re.IGNORECASE)
@@ -2701,7 +2759,7 @@ def extract_model_tokens(text: str) -> List[str]:
     text_lower = text_clean.lower()
     if 'reno' in text_lower:
         # Match patterns like "reno 2 z", "reno 4 f", "reno z", "reno f"
-        # After de-concat: "reno2" → "reno 2", so digit may be a separate token
+        # After de-concat: "reno2" -> "reno 2", so digit may be a separate token
         reno_variant_match = re.search(r'\breno\s*\d*\s+(z|f)\b', text_lower)
         if reno_variant_match:
             variant_letter = reno_variant_match.group(1)
@@ -2748,14 +2806,14 @@ def extract_model_identity(text: str) -> str:
     Only fires for brands in _MODEL_IDENTITY_BRANDS.
 
     Examples:
-        'Oppo Reno4 Pro 128GB'            → 'reno4pro'
-        'Oppo Reno6 Dual 128GB'           → 'reno6'
-        'Reno10 Pro 5G'                    → 'reno10pro'
-        'Redmi Note 12 Turbo 256GB'       → 'note12turbo'
-        'Poco F4 GT 128GB'                → 'pocof4gt'
-        'Xiaomi 14 Ultra'                 → 'xiaomi14ultra'
-        'Xiaomi 14 Ultra Photography Kit' → 'xiaomi14ultra'  (kit is NOT identity)
-        'Apple iPhone 15 Pro'             → ''  (not a targeted brand)
+        'Oppo Reno4 Pro 128GB'            -> 'reno4pro'
+        'Oppo Reno6 Dual 128GB'           -> 'reno6'
+        'Reno10 Pro 5G'                    -> 'reno10pro'
+        'Redmi Note 12 Turbo 256GB'       -> 'note12turbo'
+        'Poco F4 GT 128GB'                -> 'pocof4gt'
+        'Xiaomi 14 Ultra'                 -> 'xiaomi14ultra'
+        'Xiaomi 14 Ultra Photography Kit' -> 'xiaomi14ultra'  (kit is NOT identity)
+        'Apple iPhone 15 Pro'             -> ''  (not a targeted brand)
     """
     if not isinstance(text, str) or not text.strip():
         return ''
@@ -2764,7 +2822,7 @@ def extract_model_identity(text: str) -> str:
     # Check if this belongs to a targeted brand
     brand_found = any(b in t for b in _MODEL_IDENTITY_BRANDS)
     if not brand_found:
-        # Also check product-line keywords that imply brand (reno → oppo, etc.)
+        # Also check product-line keywords that imply brand (reno -> oppo, etc.)
         if not any(kw in t for kw in ('reno', 'note', 'poco', 'redmi')):
             return ''
 
@@ -3290,12 +3348,12 @@ def _verify_critical_attributes_inner(query: str, matched: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Matching logic — recursive brand → attribute → fuzzy
+# Matching logic — recursive brand -> attribute -> fuzzy
 # ---------------------------------------------------------------------------
 
 def compute_confidence_breakdown(query: str, matched: str) -> dict:
     """
-    Compute a diagnostic confidence breakdown for a query→matched pair.
+    Compute a diagnostic confidence breakdown for a query->matched pair.
 
     Purely diagnostic — does NOT change any match decisions.
     Useful for debugging why a match was accepted or rejected.
@@ -3316,7 +3374,7 @@ def compute_confidence_breakdown(query: str, matched: str) -> dict:
     m_cat = extract_category(matched)
     category_match = (q_cat == m_cat) or q_cat == 'other' or m_cat == 'other'
     if not category_match:
-        risk_flags.append(f'category_mismatch:{q_cat}→{m_cat}')
+        risk_flags.append(f'category_mismatch:{q_cat}->{m_cat}')
 
     # Model tokens — set-based comparison (order-independent, matching token_sort_ratio)
     q_tokens = extract_model_tokens(query)
@@ -3332,11 +3390,11 @@ def compute_confidence_breakdown(query: str, matched: str) -> dict:
         if not common:
             # No overlap at all
             model_match = False
-            risk_flags.append(f'model_no_overlap:{q_tokens}→{m_tokens}')
+            risk_flags.append(f'model_no_overlap:{q_tokens}->{m_tokens}')
         elif q_primary and m_primary and q_primary != m_primary:
             # Primary numeric token differs (e.g., "14" vs "15", "s23" vs "s24")
             model_match = False
-            risk_flags.append(f'model_primary_mismatch:{q_primary}→{m_primary}')
+            risk_flags.append(f'model_primary_mismatch:{q_primary}->{m_primary}')
         elif q_set != m_set:
             # Sets differ — check if difference is significant
             diff = (q_set - m_set) | (m_set - q_set)
@@ -3361,7 +3419,7 @@ def compute_confidence_breakdown(query: str, matched: str) -> dict:
     storage_match = True
     if q_storage and m_storage and q_storage != m_storage:
         storage_match = False
-        risk_flags.append(f'storage_mismatch:{q_storage}→{m_storage}')
+        risk_flags.append(f'storage_mismatch:{q_storage}->{m_storage}')
 
     # Watch mm
     q_mm = extract_watch_mm(query)
@@ -3369,7 +3427,7 @@ def compute_confidence_breakdown(query: str, matched: str) -> dict:
     watch_mm_match = True
     if q_mm and m_mm and q_mm != m_mm:
         watch_mm_match = False
-        risk_flags.append(f'watch_mm_mismatch:{q_mm}→{m_mm}')
+        risk_flags.append(f'watch_mm_mismatch:{q_mm}->{m_mm}')
 
     # Brand (simple check)
     q_words = query.lower().split()
@@ -3465,7 +3523,7 @@ def tablet_variant_exact_match(query_attrs: Dict, candidate_attrs: Dict) -> Tupl
     Strict tablet-specific gate: MATCHED only if core tablet attributes are identical.
 
     Checks tablet_family, size_inches, generation, year, variant_tokens, model_number.
-    Any mismatch → REVIEW_REQUIRED, never MATCHED.
+    Any mismatch -> REVIEW_REQUIRED, never MATCHED.
     """
     mismatches = []
 
@@ -3557,8 +3615,8 @@ def laptop_variant_exact_match(query_attrs: Dict, candidate_attrs: Dict) -> Tupl
     - storage (512gb != 256gb)
     - product_line/series (latitude != inspiron, thinkpad != ideapad)
 
-    If query has an attribute but candidate lacks it → reject.
-    If both have an attribute and they differ → reject.
+    If query has an attribute but candidate lacks it -> reject.
+    If both have an attribute and they differ -> reject.
 
     Returns (match: bool, mismatches: list[str])
     """
@@ -3577,7 +3635,7 @@ def laptop_variant_exact_match(query_attrs: Dict, candidate_attrs: Dict) -> Tupl
     if q_line and c_line and q_line != c_line:
         mismatches.append(f'laptop_series:{q_line}!={c_line}')
     elif q_line and not c_line:
-        # Query specifies series but candidate doesn't → reject
+        # Query specifies series but candidate doesn't -> reject
         mismatches.append(f'laptop_series_missing:{q_line}')
 
     # Processor family must match (i3/i5/i7/i9, m1/m2/m4, ryzen3/5/7/9)
@@ -3632,7 +3690,7 @@ def laptop_variant_exact_match(query_attrs: Dict, candidate_attrs: Dict) -> Tupl
         mismatches.append(f'laptop_family_missing:{q_fam}')
 
     # Model code: sf314 != sf514, ux325 != ux425
-    # ONE-SIDED: query has a hardware code → candidate must confirm it.
+    # ONE-SIDED: query has a hardware code -> candidate must confirm it.
     q_mc = query_attrs.get('model_code', '').lower().strip()
     c_mc = candidate_attrs.get('model_code', '').lower().strip()
     if q_mc and c_mc and q_mc != c_mc:
@@ -3666,7 +3724,7 @@ def mobile_variant_exact_match(query_attrs: Dict, candidate_attrs: Dict) -> Tupl
     Strict mobile-specific gate: MATCHED only if core attributes are identical.
 
     Checks brand, product_line, model (normalized), storage, and variant tokens.
-    Any mismatch → REVIEW_REQUIRED, never MATCHED.
+    Any mismatch -> REVIEW_REQUIRED, never MATCHED.
     """
     mismatches = []
 
@@ -3745,10 +3803,10 @@ def _enforce_gate(result: dict, query: str) -> dict:
     Applied to all match paths (attribute, signature, fuzzy).
 
     Category-specific rules:
-    - MOBILE: strict mobile_variant_exact_match required; fuzzy → always REVIEW_REQUIRED
-    - LAPTOP: model tokens/codes relaxed; fuzzy → always REVIEW_REQUIRED
+    - MOBILE: strict mobile_variant_exact_match required; fuzzy -> always REVIEW_REQUIRED
+    - LAPTOP: model tokens/codes relaxed; fuzzy -> always REVIEW_REQUIRED
     - TABLET: screen_inches and generation must match
-    - ALL: fuzzy method → always REVIEW_REQUIRED (never MATCHED)
+    - ALL: fuzzy method -> always REVIEW_REQUIRED (never MATCHED)
     """
     if result.get('match_status') != MATCH_STATUS_MATCHED:
         return result  # Only enforce on MATCHED
@@ -3767,7 +3825,7 @@ def _enforce_gate(result: dict, query: str) -> dict:
     is_tablet = (query_cat == 'tablet' or input_cat in ('tablet', 'tab'))
 
     # -----------------------------------------------------------------------
-    # PART 6: Fuzzy matches → ALWAYS REVIEW_REQUIRED, never MATCHED
+    # PART 6: Fuzzy matches -> ALWAYS REVIEW_REQUIRED, never MATCHED
     # Only attribute and signature matches are allowed to be MATCHED.
     # -----------------------------------------------------------------------
     if 'fuzzy' in method:
@@ -3878,7 +3936,7 @@ def _enforce_gate(result: dict, query: str) -> dict:
         return result
 
     # Gate failed: determine severity of downgrade
-    # Model identity mismatch on attribute match = wrong product entirely → NO_MATCH
+    # Model identity mismatch on attribute match = wrong product entirely -> NO_MATCH
     # (e.g., Reno4 matched to Reno2 via attribute index — product doesn't exist in catalog)
     _has_identity_mismatch = any(r.startswith('model_identity_mismatch:') for r in gate_reasons)
     _is_attribute_method = method.startswith('attribute')
@@ -3917,19 +3975,19 @@ def verification_gate(query_norm: str, cand_norm: str) -> Tuple[bool, List[str]]
     Strict verification gate applied before returning MATCHED for any match path.
 
     Checks hard constraints:
-        1. Category cross-match: both known & different → reject
-        2. Storage mismatch: both present & different → reject
-        3. Watch mm mismatch: both present & different → reject
-        4. Primary model token mismatch: both present & different → reject
-        5. Material mismatch (watches): aluminium vs steel vs titanium → reject
-        6. Variant token mismatch: pro vs pro max, fold vs non-fold → reject
-        7. Hardware model code mismatch: ZE552KL vs ZE520KL → reject
+        1. Category cross-match: both known & different -> reject
+        2. Storage mismatch: both present & different -> reject
+        3. Watch mm mismatch: both present & different -> reject
+        4. Primary model token mismatch: both present & different -> reject
+        5. Material mismatch (watches): aluminium vs steel vs titanium -> reject
+        6. Variant token mismatch: pro vs pro max, fold vs non-fold -> reject
+        7. Hardware model code mismatch: ZE552KL vs ZE520KL -> reject
 
     Returns:
         (pass_gate: bool, reasons: list[str])
         If pass_gate is False, the match must NOT be returned as MATCHED.
     """
-    # Re-normalize candidate to apply latest normalization rules (e.g., "reno7" → "reno 7")
+    # Re-normalize candidate to apply latest normalization rules (e.g., "reno7" -> "reno 7")
     # NL catalog's stored normalized_name may use older normalization without de-concat splits
     cand_norm = normalize_text(cand_norm)
     reasons = []
@@ -3938,19 +3996,19 @@ def verification_gate(query_norm: str, cand_norm: str) -> Tuple[bool, List[str]]
     q_cat = extract_category(query_norm)
     m_cat = extract_category(cand_norm)
     if q_cat != 'other' and m_cat != 'other' and q_cat != m_cat:
-        reasons.append(f'category_cross:{q_cat}→{m_cat}')
+        reasons.append(f'category_cross:{q_cat}->{m_cat}')
 
     # 2. Storage mismatch
     q_storage = extract_storage(query_norm)
     m_storage = extract_storage(cand_norm)
     if q_storage and m_storage and q_storage != m_storage:
-        reasons.append(f'storage_mismatch:{q_storage}→{m_storage}')
+        reasons.append(f'storage_mismatch:{q_storage}->{m_storage}')
 
     # 3. Watch mm mismatch
     q_mm = extract_watch_mm(query_norm)
     m_mm = extract_watch_mm(cand_norm)
     if q_mm and m_mm and q_mm != m_mm:
-        reasons.append(f'watch_mm_mismatch:{q_mm}→{m_mm}')
+        reasons.append(f'watch_mm_mismatch:{q_mm}->{m_mm}')
 
     # 4. Model token mismatch (set-based with primary token check)
     q_tokens = extract_model_tokens(query_norm)
@@ -3971,11 +4029,11 @@ def verification_gate(query_norm: str, cand_norm: str) -> Tuple[bool, List[str]]
         # Only compare non-year, non-model-code, deduplicated tokens
         if q_filtered and m_filtered:
             if len(q_filtered) != len(m_filtered):
-                reasons.append(f'model_token_count:{q_filtered}→{m_filtered}')
+                reasons.append(f'model_token_count:{q_filtered}->{m_filtered}')
             else:
                 for qt, mt in zip(q_filtered, m_filtered):
                     if qt != mt:
-                        reasons.append(f'model_token_mismatch:{qt}→{mt}')
+                        reasons.append(f'model_token_mismatch:{qt}->{mt}')
                         break
     elif q_tokens and not m_tokens:
         # Query has model tokens (e.g., "reno2") but candidate has NONE (e.g., "reno z")
@@ -4006,7 +4064,7 @@ def verification_gate(query_norm: str, cand_norm: str) -> Tuple[bool, List[str]]
     q_mat = _detect_material(query_norm)
     m_mat = _detect_material(cand_norm)
     if q_mat and m_mat and q_mat != m_mat:
-        reasons.append(f'material_mismatch:{q_mat}→{m_mat}')
+        reasons.append(f'material_mismatch:{q_mat}->{m_mat}')
     # Strict watch material gate: if query is a watch with material, candidate must also have
     # matching material (prevents aluminum watch matching stainless steel variant)
     if q_cat == 'watch' and m_cat == 'watch':
@@ -4022,7 +4080,7 @@ def verification_gate(query_norm: str, cand_norm: str) -> Tuple[bool, List[str]]
         q_edition = extract_watch_edition(query_norm)
         m_edition = extract_watch_edition(cand_norm)
         if q_edition and m_edition and q_edition != m_edition:
-            reasons.append(f'watch_edition_mismatch:{q_edition}→{m_edition}')
+            reasons.append(f'watch_edition_mismatch:{q_edition}->{m_edition}')
         elif q_edition and not m_edition:
             reasons.append(f'watch_edition_missing_in_candidate:{q_edition}')
         elif m_edition and not q_edition:
@@ -4032,13 +4090,13 @@ def verification_gate(query_norm: str, cand_norm: str) -> Tuple[bool, List[str]]
     q_variants = extract_variant_tokens(query_norm)
     m_variants = extract_variant_tokens(cand_norm)
     if q_variants != m_variants:
-        reasons.append(f'variant_mismatch:{q_variants}→{m_variants}')
+        reasons.append(f'variant_mismatch:{q_variants}->{m_variants}')
 
     # 7. Hardware model code mismatch (ZE552KL vs ZE520KL, etc.)
     q_code = extract_model_code(query_norm)
     m_code = extract_model_code(cand_norm)
     if q_code and m_code and q_code != m_code:
-        reasons.append(f'model_code_mismatch:{q_code}→{m_code}')
+        reasons.append(f'model_code_mismatch:{q_code}->{m_code}')
 
     # 8. Tablet screen size mismatch (10.4 vs 11.0 — different products)
     # Only fires for tablets — cannot affect phones/watches/laptops
@@ -4054,7 +4112,7 @@ def verification_gate(query_norm: str, cand_norm: str) -> Tuple[bool, List[str]]
             m_size = float(m_screen_m.group(1))
             if 7.0 <= q_size <= 13.0 and 7.0 <= m_size <= 13.0:
                 if abs(q_size - m_size) > 0.15:  # tolerance for 10.4 vs 10.5 rounding
-                    reasons.append(f'tablet_screen_mismatch:{q_size}→{m_size}')
+                    reasons.append(f'tablet_screen_mismatch:{q_size}->{m_size}')
 
     # 9. Tablet line mismatch (pro vs base, se vs pro — different products)
     # Only fires for tablets
@@ -4068,7 +4126,7 @@ def verification_gate(query_norm: str, cand_norm: str) -> Tuple[bool, List[str]]
             if re.search(r'\b' + kw + r'\b', cand_norm):
                 m_tl.add(kw)
         if q_tl and m_tl and q_tl != m_tl:
-            reasons.append(f'tablet_line_mismatch:{q_tl}→{m_tl}')
+            reasons.append(f'tablet_line_mismatch:{q_tl}->{m_tl}')
         elif q_tl and not m_tl:
             reasons.append(f'tablet_line_missing_in_candidate:{q_tl}')
 
@@ -4078,7 +4136,7 @@ def verification_gate(query_norm: str, cand_norm: str) -> Tuple[bool, List[str]]
         q_gen = extract_tablet_generation(query_norm)
         m_gen = extract_tablet_generation(cand_norm)
         if q_gen and m_gen and q_gen != m_gen:
-            reasons.append(f'tablet_generation_mismatch:{q_gen}→{m_gen}')
+            reasons.append(f'tablet_generation_mismatch:{q_gen}->{m_gen}')
 
     # 9c. Tablet/laptop screen inches mismatch (8.3 vs 10.9 — different products)
     # Only fires for tablets — uses extract_screen_inches for canonical extraction
@@ -4089,7 +4147,7 @@ def verification_gate(query_norm: str, cand_norm: str) -> Tuple[bool, List[str]]
             q_val = float(q_screen)
             m_val = float(m_screen)
             if abs(q_val - m_val) > 0.15:
-                reasons.append(f'screen_inches_mismatch:{q_screen}→{m_screen}')
+                reasons.append(f'screen_inches_mismatch:{q_screen}->{m_screen}')
 
     # 10. Year mismatch (2023 vs 2024 — different model years)
     # Applies to tablets and laptops (especially MacBooks)
@@ -4098,10 +4156,10 @@ def verification_gate(query_norm: str, cand_norm: str) -> Tuple[bool, List[str]]
     if q_year_m and m_year_m and q_year_m.group(1) != m_year_m.group(1):
         # Only enforce for categories where year distinguishes product generations
         if q_cat in ('tablet', 'laptop') or m_cat in ('tablet', 'laptop'):
-            reasons.append(f'year_mismatch:{q_year_m.group(1)}→{m_year_m.group(1)}')
+            reasons.append(f'year_mismatch:{q_year_m.group(1)}->{m_year_m.group(1)}')
 
     # 11. Brand-specific model identity guardrail (OPPO/Xiaomi/Redmi/Poco)
-    # Catches cross-generation mismatches like Reno4→Reno3, Note 12 Turbo→Note 12
+    # Catches cross-generation mismatches like Reno4->Reno3, Note 12 Turbo->Note 12
     id_pass, id_reason = model_identity_guardrail(query_norm, cand_norm)
     if not id_pass:
         reasons.append(id_reason)
@@ -4399,7 +4457,7 @@ def match_laptop_by_attributes(
             }
         return None
 
-    # Completeness or margin fail → REVIEW_REQUIRED
+    # Completeness or margin fail -> REVIEW_REQUIRED
     if not complete or (top_score - second_score) < MARGIN:
         alts = _top3_alt_ids()
         reason_parts = []
@@ -4466,7 +4524,7 @@ def match_laptop_by_attributes(
                     'alternatives': others,
                 }
 
-    # Multi-ID, no tie-breaker → REVIEW_REQUIRED with all candidates
+    # Multi-ID, no tie-breaker -> REVIEW_REQUIRED with all candidates
     alt_details = []
     for aid in asset_ids:
         if nl_catalog is not None:
@@ -4514,7 +4572,7 @@ def match_single_item(
         0.5. SIGNATURE MATCHING: Deterministic variant resolution
            - Catches material/CPU/storage variant mismatches attribute matching misses
         1. BRAND FILTER: If brand is known, search only within that brand's products
-           (e.g., 9,894 → ~2,000 Apple records). Eliminates cross-brand errors.
+           (e.g., 9,894 -> ~2,000 Apple records). Eliminates cross-brand errors.
         2. CATEGORY FILTER: Prevent cross-category matches (Tab vs Watch, Mobile vs Laptop)
         3. STORAGE FILTER: If storage is detected (e.g., "16gb"), prefer candidates
            with the same storage. Prevents "16GB" matching "128GB" variants.
@@ -4542,7 +4600,7 @@ def match_single_item(
         return no_match_result
 
     # Guard: reject NaN-like, whitespace-only, or sub-3-char queries
-    # These produce spurious fuzzy matches (e.g., blank Foxway Product Name → iPad)
+    # These produce spurious fuzzy matches (e.g., blank Foxway Product Name -> iPad)
     query_clean = normalize_text(query)
     if not query_clean or len(query_clean) < 3 or query_clean in ('nan', 'none', 'na', 'n/a'):
         no_match_result['method'] = 'empty_input'
@@ -4555,7 +4613,7 @@ def match_single_item(
         if inferred:
             input_brand = inferred
         else:
-            # Cannot determine brand → REVIEW_REQUIRED, never MATCHED
+            # Cannot determine brand -> REVIEW_REQUIRED, never MATCHED
             no_match_result['method'] = 'missing_brand'
             no_match_result['match_status'] = MATCH_STATUS_SUGGESTED
             no_match_result['confidence'] = CONFIDENCE_LOW
@@ -4780,7 +4838,7 @@ def _match_single_item_inner(
             if category_filtered:
                 fallback_names = category_filtered
             else:
-                # No same-category products in entire catalog → return NO_MATCH
+                # No same-category products in entire catalog -> return NO_MATCH
                 return no_match_result
 
         result = process.extractOne(
@@ -4792,7 +4850,7 @@ def _match_single_item_inner(
         search_lookup = nl_lookup  # use full lookup for ID resolution
 
     if result is None:
-        # --- Near-miss recovery: 80-84 score band → REVIEW_REQUIRED if gate passes ---
+        # --- Near-miss recovery: 80-84 score band -> REVIEW_REQUIRED if gate passes ---
         # Only attempt if threshold is the default (don't override raised thresholds)
         near_miss_cutoff = 80
         if effective_threshold <= SIMILARITY_THRESHOLD and widen_mode != 'conservative':
@@ -4837,8 +4895,8 @@ def _match_single_item_inner(
 
     # --- Level 5: Model token guardrail ---
     # Applied to ALL scores (including >= 95%) to prevent false positives
-    # like Pixel 9 → Pixel 3 (95%), Mate 20 → Mate 40 (95%),
-    # Nova 5T → Nova 5i (95%), A57 → A57s (96%)
+    # like Pixel 9 -> Pixel 3 (95%), Mate 20 -> Mate 40 (95%),
+    # Nova 5T -> Nova 5i (95%), A57 -> A57s (96%)
     # Pro vs Pro Max (different products!), Plus variants, XL variants
     q_tokens = extract_model_tokens(query)
     m_tokens = extract_model_tokens(best_match)
@@ -4848,7 +4906,7 @@ def _match_single_item_inner(
         if len(q_tokens) != len(m_tokens):
             score = min(score, threshold - 1)  # Demote to NO_MATCH
         else:
-            # Same count → compare position by position (e.g., "5t" vs "5i", "s23" vs "s24")
+            # Same count -> compare position by position (e.g., "5t" vs "5i", "s23" vs "s24")
             for qt, mt in zip(q_tokens, m_tokens):
                 if qt != mt:
                     score = min(score, threshold - 1)  # Demote to NO_MATCH
@@ -4860,7 +4918,7 @@ def _match_single_item_inner(
         # could still accept it because verification_gate skipped the empty-tokens case.
         score = min(score, threshold - 1)  # Demote to NO_MATCH
     elif not q_tokens and m_tokens:
-        # Match has model token but query doesn't (e.g., "Find X" → "Find X9")
+        # Match has model token but query doesn't (e.g., "Find X" -> "Find X9")
         # Demote to review — the match added a model number the query doesn't have
         score = min(score, HIGH_CONFIDENCE_THRESHOLD - 1)  # Demote to REVIEW at most
 
@@ -4896,7 +4954,7 @@ def _match_single_item_inner(
         # V2 EDIT 1: Upgrade to REVIEW_REQUIRED with top-3 fuzzy candidates
         # instead of NO_MATCH — makes the result actionable for human review.
         # Never MATCHED, only REVIEW_REQUIRED with FUZZY_ONLY reason.
-        # Task B: In conservative mode (List 1), skip upgrade → keep NO_MATCH.
+        # Task B: In conservative mode (List 1), skip upgrade -> keep NO_MATCH.
         if widen_mode == 'conservative':
             return {
                 'mapped_uae_assetid': '',
@@ -4975,7 +5033,7 @@ def _match_single_item_inner(
         # Otherwise, keep as REVIEW_REQUIRED for human verification
 
         # --- Soft Similarity Upgrade ---
-        # Score >= 88 with ALL key attributes matching → safe to upgrade to MATCHED
+        # Score >= 88 with ALL key attributes matching -> safe to upgrade to MATCHED
         # This recovers items in the 88-89 band that are clearly correct matches
         # but fall just below the 90 HIGH_CONFIDENCE_THRESHOLD
         SOFT_UPGRADE_THRESHOLD = 88
@@ -5157,20 +5215,20 @@ def run_matching(
     Run hybrid matching for an entire input DataFrame against the NL lookup.
 
     Matching is hybrid (attribute-based fast path + signature + fuzzy fallback):
-        0. Attribute matching (fast path) → 70-80% of queries in 2-5ms
-        0.5. Signature matching → deterministic variant resolution
-        1. Brand partition → narrows search to one brand
-        2. Category filter → prevents cross-category errors
-        3. Storage filter → narrows to same storage variant
-        4. Fuzzy match → finds best candidate
-        5. Model token guard → rejects wrong model tokens
-        6. Auto-select → automatically selects best variant from multiple matches
+        0. Attribute matching (fast path) -> 70-80% of queries in 2-5ms
+        0.5. Signature matching -> deterministic variant resolution
+        1. Brand partition -> narrows search to one brand
+        2. Category filter -> prevents cross-category errors
+        3. Storage filter -> narrows to same storage variant
+        4. Fuzzy match -> finds best candidate
+        5. Model token guard -> rejects wrong model tokens
+        6. Auto-select -> automatically selects best variant from multiple matches
 
     Args:
         df_input: The input asset list (List 1 or List 2)
         brand_col: Column name containing the brand/manufacturer
         name_col: Column name containing the product name
-        nl_lookup: dict of normalized_name → [asset_ids] (full, for fallback)
+        nl_lookup: dict of normalized_name -> [asset_ids] (full, for fallback)
         nl_names: list of all normalized NL names (full, for fallback)
         threshold: minimum similarity score
         progress_callback: optional callable(current, total) for UI progress
@@ -5200,7 +5258,9 @@ def run_matching(
     # Pre-detect fallback columns for URL/name recovery (once, not per-row)
     _FALLBACK_NAME_COLS = ['product_name', 'product name', 'title', 'name',
                            'asset name', 'asset_name', 'model_name', 'model name']
-    _FALLBACK_URL_COLS = ['url', 'product_url', 'link', 'href', 'product_slug']
+    _FALLBACK_URL_COLS = ['url', 'product_url', 'product url', 'link', 'href',
+                          'product_slug', 'product_link', 'page_url', 'page url',
+                          'source_url', 'source url', 'item_url', 'item url']
     col_lower_map = {str(c).strip().lower(): str(c).strip() for c in df.columns}
     fallback_name_col = None
     for fc in _FALLBACK_NAME_COLS:
@@ -5290,7 +5350,7 @@ def run_matching(
 
             # ENHANCEMENT: If storage/capacity column exists, combine it with product name
             # This improves matching for datasets that separate model and capacity
-            # Example: "iPad Pro 2022 11" + "128GB" → "iPad Pro 2022 11 128GB"
+            # Example: "iPad Pro 2022 11" + "128GB" -> "iPad Pro 2022 11 128GB"
             if storage_col:
                 storage_value = str(row.get(storage_col, '')).strip()
                 if storage_value:
@@ -5658,7 +5718,7 @@ def compute_coverage_metrics(df_results: pd.DataFrame) -> Dict[str, any]:
         near_miss_count: NO_MATCH items where top candidate scored 80-84
         false_positive_risk_count: MATCHED items where verification_gate would fail
         avg_match_score: average score of MATCHED items
-        method_breakdown: dict of method → count
+        method_breakdown: dict of method -> count
     """
     total = len(df_results)
     if total == 0:
@@ -5722,11 +5782,11 @@ def detect_catalog_gaps(
     Analyze NO_MATCH items to identify catalog gaps and improvement opportunities.
 
     Returns a dict with:
-        unmatched_brands: dict of brand → count for NO_MATCH items
+        unmatched_brands: dict of brand -> count for NO_MATCH items
         high_volume_unmatched: list of product names appearing >= 3 times as NO_MATCH
         near_miss_candidates: list of dicts with query, top_candidate, score for 80-84 band
-        brand_coverage: dict of brand → {matched, total, rate} for each brand
-        category_coverage: dict of category → {matched, total, rate}
+        brand_coverage: dict of brand -> {matched, total, rate} for each brand
+        category_coverage: dict of category -> {matched, total, rate}
     """
     total = len(df_results)
     if total == 0:
@@ -6164,7 +6224,7 @@ def parse_asset_sheets(file) -> Dict[str, Dict]:
         - Detects brand and product-name columns
         - Drops the leading empty index column if present
 
-    Returns dict:  sheet_name → {
+    Returns dict:  sheet_name -> {
         'df': pd.DataFrame,
         'brand_col': str or None,
         'name_col': str,
@@ -6212,7 +6272,7 @@ def parse_asset_sheets(file) -> Dict[str, Dict]:
                 _nunique = df[col_map['name_col']].nunique()
                 _total = max(len(df), 1)
                 if _nunique / _total < 0.1 and _nunique <= 10:
-                    # Name column is categorical → extract product names from URLs
+                    # Name column is categorical -> extract product names from URLs
                     df['product_name'] = (
                         df[_url_col_name]
                         .apply(extract_name_from_url)
@@ -6647,42 +6707,42 @@ def self_test_verification() -> List[str]:
 
     # === TASK A: Watch edition regression tests ===
 
-    # 41. Nike edition vs base watch → reject
+    # 41. Nike edition vs base watch -> reject
     p41, _ = verification_gate(
         normalize_text('apple watch series 9 45mm gps nike aluminum'),
         normalize_text('apple watch series 9 45mm gps aluminum'))
     if p41:
         failures.append('FAIL: Watch Nike vs base should be rejected')
 
-    # 42. Black Unity vs base watch → reject
+    # 42. Black Unity vs base watch -> reject
     p42, _ = verification_gate(
         normalize_text('apple watch series 9 45mm black unity'),
         normalize_text('apple watch series 9 45mm'))
     if p42:
         failures.append('FAIL: Watch Black Unity vs base should be rejected')
 
-    # 43. Hermes vs base watch → reject
+    # 43. Hermes vs base watch -> reject
     p43, _ = verification_gate(
         normalize_text('apple watch series 9 45mm hermes'),
         normalize_text('apple watch series 9 45mm'))
     if p43:
         failures.append('FAIL: Watch Hermes vs base should be rejected')
 
-    # 44. Edition vs base watch → reject
+    # 44. Edition vs base watch -> reject
     p44, _ = verification_gate(
         normalize_text('apple watch series 9 45mm special edition'),
         normalize_text('apple watch series 9 45mm'))
     if p44:
         failures.append('FAIL: Watch Special Edition vs base should be rejected')
 
-    # 45. Nike vs Hermes → reject
+    # 45. Nike vs Hermes -> reject
     p45, _ = verification_gate(
         normalize_text('apple watch series 9 45mm nike'),
         normalize_text('apple watch series 9 45mm hermes'))
     if p45:
         failures.append('FAIL: Watch Nike vs Hermes should be rejected')
 
-    # 46. Matching Nike editions → pass
+    # 46. Matching Nike editions -> pass
     p46, _ = verification_gate(
         normalize_text('apple watch series 9 45mm nike aluminum'),
         normalize_text('apple watch series 9 45mm nike aluminum'))
@@ -6691,21 +6751,21 @@ def self_test_verification() -> List[str]:
 
     # === TASK B: Tablet size + line regression tests ===
 
-    # 47. MatePad 10.4 vs MatePad Pro 11.0 → reject (size + line mismatch)
+    # 47. MatePad 10.4 vs MatePad Pro 11.0 -> reject (size + line mismatch)
     p47, r47 = verification_gate(
         normalize_text('huawei matepad 10.4 2022 128gb'),
         normalize_text('huawei matepad pro 11.0 2022 128gb'))
     if p47:
         failures.append(f'FAIL: MatePad 10.4 vs MatePad Pro 11.0 should be rejected: {r47}')
 
-    # 48. iPad Pro 11 vs iPad Pro 12.9 → reject (size mismatch)
+    # 48. iPad Pro 11 vs iPad Pro 12.9 -> reject (size mismatch)
     p48, _ = verification_gate(
         normalize_text('apple ipad pro 11 2022 256gb'),
         normalize_text('apple ipad pro 12.9 2022 256gb'))
     if p48:
         failures.append('FAIL: iPad Pro 11 vs 12.9 should be rejected')
 
-    # 49. MatePad base vs MatePad Pro → reject (tablet_line mismatch)
+    # 49. MatePad base vs MatePad Pro -> reject (tablet_line mismatch)
     p49, _ = verification_gate(
         normalize_text('huawei matepad 10.4 128gb'),
         normalize_text('huawei matepad pro 10.4 128gb'))
@@ -6714,14 +6774,14 @@ def self_test_verification() -> List[str]:
 
     # === TASK C: MacBook year strictness ===
 
-    # 50. MacBook Pro 2023 vs MacBook Pro 2024 → reject
+    # 50. MacBook Pro 2023 vs MacBook Pro 2024 -> reject
     p50, _ = verification_gate(
         normalize_text('apple macbook pro 2023 m3 16gb 512gb'),
         normalize_text('apple macbook pro 2024 m3 16gb 512gb'))
     if p50:
         failures.append('FAIL: MacBook Pro 2023 vs 2024 should be rejected')
 
-    # 51. MacBook Pro 2023 vs MacBook Pro 2023 → pass
+    # 51. MacBook Pro 2023 vs MacBook Pro 2023 -> pass
     p51, _ = verification_gate(
         normalize_text('apple macbook pro 2023 m3 16gb 512gb'),
         normalize_text('apple macbook pro 2023 m3 16gb 512gb'))
@@ -6755,21 +6815,21 @@ def self_test_verification() -> List[str]:
 
     # === PATCH 8: New regression tests ===
 
-    # 57. iPad Mini 7th gen vs iPad Mini 5th gen → reject (generation mismatch)
+    # 57. iPad Mini 7th gen vs iPad Mini 5th gen -> reject (generation mismatch)
     p57, r57 = verification_gate(
         normalize_text('apple ipad mini 7th gen 256gb'),
         normalize_text('apple ipad mini 5th gen 256gb'))
     if p57:
         failures.append(f'FAIL: iPad Mini 7th gen vs 5th gen should be rejected: {r57}')
 
-    # 58. MatePad 10.4 vs MatePad 11 → reject (screen inches mismatch)
+    # 58. MatePad 10.4 vs MatePad 11 -> reject (screen inches mismatch)
     p58, r58 = verification_gate(
         normalize_text('huawei matepad 10.4 128gb'),
         normalize_text('huawei matepad 11 inch 128gb'))
     if p58:
         failures.append(f'FAIL: MatePad 10.4 vs 11 should be rejected: {r58}')
 
-    # 59. Watch Nike vs standard → reject (edition mismatch)
+    # 59. Watch Nike vs standard -> reject (edition mismatch)
     p59, r59 = verification_gate(
         normalize_text('apple watch series 9 45mm gps nike'),
         normalize_text('apple watch series 9 45mm gps'))
@@ -6781,32 +6841,32 @@ def self_test_verification() -> List[str]:
     if empty2_result['match_status'] != MATCH_STATUS_NO_MATCH:
         failures.append(f'FAIL: Empty input should return NO_MATCH, got {empty2_result["match_status"]}')
 
-    # 61. extract_tablet_generation: "7th gen" → "7"
+    # 61. extract_tablet_generation: "7th gen" -> "7"
     if extract_tablet_generation('apple ipad mini 7th gen 256gb') != '7':
         failures.append(
             f'FAIL: extract_tablet_generation("...7th gen...") — expected "7", '
             f'got "{extract_tablet_generation("apple ipad mini 7th gen 256gb")}"')
 
-    # 62. extract_tablet_generation: "gen5" (from normalize_text) → "5"
+    # 62. extract_tablet_generation: "gen5" (from normalize_text) -> "5"
     if extract_tablet_generation('apple ipad gen5 wifi 128gb') != '5':
         failures.append(
             f'FAIL: extract_tablet_generation("...gen5...") — expected "5", '
             f'got "{extract_tablet_generation("apple ipad gen5 wifi 128gb")}"')
 
-    # 63. extract_screen_inches: "8.3 inch" → "8.3"
+    # 63. extract_screen_inches: "8.3 inch" -> "8.3"
     if extract_screen_inches('apple ipad mini 8.3 inch 256gb') != '8.3':
         failures.append(
             f'FAIL: extract_screen_inches("...8.3 inch...") — expected "8.3", '
             f'got "{extract_screen_inches("apple ipad mini 8.3 inch 256gb")}"')
 
-    # 64. extract_screen_inches: bare "10.4" → "10.4"
+    # 64. extract_screen_inches: bare "10.4" -> "10.4"
     if extract_screen_inches('huawei matepad 10.4 128gb') != '10.4':
         failures.append(
             f'FAIL: extract_screen_inches("...10.4...") — expected "10.4", '
             f'got "{extract_screen_inches("huawei matepad 10.4 128gb")}"')
 
     # 65. Signature includes generation: iPad mini 7th gen
-    # Generation is encoded as "gen7" in the model part (from normalize_text "7th gen" → "gen7")
+    # Generation is encoded as "gen7" in the model part (from normalize_text "7th gen" -> "gen7")
     sig65 = build_variant_signature(
         extract_product_attributes('apple ipad mini 7th gen 256gb', 'apple'))
     if 'gen7' not in sig65:
@@ -7091,12 +7151,12 @@ def self_test_verification() -> List[str]:
     if pass102:
         failures.append(f'FAIL: iPad Pro M1 vs M2 should NOT match: {r102}')
 
-    # 103. tablet_family extraction: iPad Pro → "ipad pro"
+    # 103. tablet_family extraction: iPad Pro -> "ipad pro"
     t103 = extract_product_attributes(normalize_text('apple ipad pro 12.9 inch 256gb'), 'apple')
     if t103.get('tablet_family') != 'ipad pro':
         failures.append(f'FAIL: tablet_family for iPad Pro should be "ipad pro", got "{t103.get("tablet_family")}"')
 
-    # 104. tablet_family extraction: MatePad Pro → "matepad pro"
+    # 104. tablet_family extraction: MatePad Pro -> "matepad pro"
     t104 = extract_product_attributes(normalize_text('huawei matepad pro 11 128gb'), 'huawei')
     if t104.get('tablet_family') != 'matepad pro':
         failures.append(f'FAIL: tablet_family for MatePad Pro should be "matepad pro", got "{t104.get("tablet_family")}"')
@@ -7106,7 +7166,7 @@ def self_test_verification() -> List[str]:
     if t105.get('connectivity') != 'wifi':
         failures.append(f'FAIL: connectivity for "...wifi" should be "wifi", got "{t105.get("connectivity")}"')
 
-    # 106. connectivity extraction: "lte" → "cellular" (pass original, not normalized)
+    # 106. connectivity extraction: "lte" -> "cellular" (pass original, not normalized)
     t106 = extract_product_attributes('apple ipad pro 11 inch lte 256gb', 'apple')
     if t106.get('connectivity') != 'cellular':
         failures.append(f'FAIL: connectivity for "...lte" should be "cellular", got "{t106.get("connectivity")}"')
@@ -7202,7 +7262,7 @@ def self_test_verification() -> List[str]:
     # === OPPO RENO MODEL TOKEN EXTRACTION TESTS ===
 
     # Reno2 Z must produce tokens including generation digit "2" AND "z" variant
-    # (after de-concat: "reno2" → "reno 2", so token is "2" not "reno2")
+    # (after de-concat: "reno2" -> "reno 2", so token is "2" not "reno2")
     reno2z_tokens = extract_model_tokens(normalize_text('oppo reno2 z 128gb'))
     if '2' not in reno2z_tokens:
         failures.append(f'FAIL: Reno2 Z tokens missing "2" - got {reno2z_tokens}')
@@ -7328,61 +7388,61 @@ def self_test_verification() -> List[str]:
 
     # === LAPTOP IMPROVEMENT TESTS ===
 
-    # 118. Brand normalization: "HP OLD" → attrs['brand'] = "hp" (not "hp old")
+    # 118. Brand normalization: "HP OLD" -> attrs['brand'] = "hp" (not "hp old")
     _l118 = extract_laptop_attributes('HP EliteBook 840 G8 Core i5 16GB 256GB', 'HP OLD')
     if _l118['brand'] != 'hp':
         failures.append(f'FAIL: Laptop brand for "HP OLD" should be "hp", got "{_l118["brand"]}"')
 
-    # 119. Brand normalization: "Dell OLD" → attrs['brand'] = "dell"
+    # 119. Brand normalization: "Dell OLD" -> attrs['brand'] = "dell"
     _l119 = extract_laptop_attributes('Dell Latitude 5420 Core i5 16GB 512GB', 'Dell OLD')
     if _l119['brand'] != 'dell':
         failures.append(f'FAIL: Laptop brand for "Dell OLD" should be "dell", got "{_l119["brand"]}"')
 
-    # 120. Brand normalization: "Lenovo OLD" → attrs['brand'] = "lenovo"
+    # 120. Brand normalization: "Lenovo OLD" -> attrs['brand'] = "lenovo"
     _l120 = extract_laptop_attributes('Lenovo ThinkPad T14 Gen 3 Core i5 16GB 256GB', 'Lenovo OLD')
     if _l120['brand'] != 'lenovo':
         failures.append(f'FAIL: Laptop brand for "Lenovo OLD" should be "lenovo", got "{_l120["brand"]}"')
 
-    # 121. Brand normalization in extract_product_attributes: "HP OLD" → "hp"
+    # 121. Brand normalization in extract_product_attributes: "HP OLD" -> "hp"
     _l121 = extract_product_attributes('HP EliteBook 840 G8 Core i5 16GB 256GB', 'HP OLD')
     if _l121['brand'] != 'hp':
         failures.append(f'FAIL: extract_product_attributes brand for "HP OLD" should be "hp", got "{_l121["brand"]}"')
 
-    # 122. Platform code: Dell Latitude 5420 → platform_code = "5420"
+    # 122. Platform code: Dell Latitude 5420 -> platform_code = "5420"
     _l122 = extract_laptop_attributes('Dell Latitude 5420 Core i5-1145G7 16GB 512GB', 'Dell')
     if _l122['platform_code'] != '5420':
         failures.append(f'FAIL: Dell platform_code should be "5420", got "{_l122["platform_code"]}"')
 
-    # 123. Platform code: HP EliteBook 840 G8 → platform_code = "840 g8"
+    # 123. Platform code: HP EliteBook 840 G8 -> platform_code = "840 g8"
     _l123 = extract_laptop_attributes('HP EliteBook 840 G8 Core i5-1145G7 16GB 256GB', 'HP')
     if _l123['platform_code'] != '840 g8':
         failures.append(f'FAIL: HP platform_code should be "840 g8", got "{_l123["platform_code"]}"')
 
-    # 124. Platform code: Lenovo ThinkPad T14 → platform_code = "t14"
+    # 124. Platform code: Lenovo ThinkPad T14 -> platform_code = "t14"
     _l124 = extract_laptop_attributes('Lenovo ThinkPad T14 Gen 3 Core i5-1245U 16GB 256GB', 'Lenovo')
     if _l124['platform_code'] != 't14':
         failures.append(f'FAIL: Lenovo platform_code should be "t14", got "{_l124["platform_code"]}"')
 
-    # 125. Platform code: Lenovo ThinkPad X1 Carbon → platform_code = "x1 carbon"
+    # 125. Platform code: Lenovo ThinkPad X1 Carbon -> platform_code = "x1 carbon"
     _l125 = extract_laptop_attributes('Lenovo ThinkPad X1 Carbon Gen 11 Core i7 16GB 512GB', 'Lenovo')
     if _l125['platform_code'] != 'x1 carbon':
         failures.append(f'FAIL: Lenovo platform_code should be "x1 carbon", got "{_l125["platform_code"]}"')
 
-    # 126. laptop_variant_exact_match: different platform codes → reject
+    # 126. laptop_variant_exact_match: different platform codes -> reject
     _l126q = extract_laptop_attributes('Dell Latitude 5420 Core i5 11th Gen 16GB 512GB', 'Dell')
     _l126c = extract_laptop_attributes('Dell Latitude 5520 Core i5 11th Gen 16GB 512GB', 'Dell')
     _pass126, _r126 = laptop_variant_exact_match(_l126q, _l126c)
     if _pass126:
         failures.append(f'FAIL: Latitude 5420 should NOT match 5520 (platform_code): {_r126}')
 
-    # 127. laptop_variant_exact_match: same platform codes → pass
+    # 127. laptop_variant_exact_match: same platform codes -> pass
     _l127q = extract_laptop_attributes('Dell Latitude 5420 Core i5 11th Gen 16GB 512GB', 'Dell')
     _l127c = extract_laptop_attributes('Dell Latitude 5420 Core i5 11th Gen 16GB 512GB', 'Dell')
     _pass127, _ = laptop_variant_exact_match(_l127q, _l127c)
     if not _pass127:
         failures.append('FAIL: Identical Latitude 5420 should match itself')
 
-    # 128. HP platform code: ProBook 640 G9 → "640 g9"
+    # 128. HP platform code: ProBook 640 G9 -> "640 g9"
     _l128 = extract_laptop_attributes('HP ProBook 640 G9 Core i5-1245U 16GB 256GB', 'HP')
     if _l128['platform_code'] != '640 g9':
         failures.append(f'FAIL: HP ProBook platform_code should be "640 g9", got "{_l128["platform_code"]}"')
@@ -7402,7 +7462,7 @@ def self_test_verification() -> List[str]:
     if _l130.get('platform_code'):
         failures.append(f'FAIL: MacBook should not have platform_code, got "{_l130["platform_code"]}"')
 
-    # 131. Dell Precision 5560 → platform_code = "5560"
+    # 131. Dell Precision 5560 -> platform_code = "5560"
     _l131 = extract_laptop_attributes('Dell Precision 5560 Core i7-11800H 32GB 1TB', 'Dell')
     if _l131['platform_code'] != '5560':
         failures.append(f'FAIL: Dell Precision platform_code should be "5560", got "{_l131["platform_code"]}"')
@@ -7419,7 +7479,7 @@ def self_test_verification() -> List[str]:
 
     # ==================== laptop_family extraction tests ====================
 
-    # 133. Acer Swift 3 vs Swift 5 → distinct laptop_family
+    # 133. Acer Swift 3 vs Swift 5 -> distinct laptop_family
     _l133a = extract_laptop_attributes('Acer Swift 3 SF314-511 Core i5 8GB 512GB', 'Acer')
     _l133b = extract_laptop_attributes('Acer Swift 5 SF514-55T Core i7 16GB 512GB', 'Acer')
     if _l133a.get('laptop_family') != 'swift 3':
@@ -7427,7 +7487,7 @@ def self_test_verification() -> List[str]:
     if _l133b.get('laptop_family') != 'swift 5':
         failures.append(f'FAIL: Acer Swift 5 laptop_family should be "swift 5", got "{_l133b.get("laptop_family")}"')
 
-    # 134. Acer Predator Helios vs Triton → distinct laptop_family
+    # 134. Acer Predator Helios vs Triton -> distinct laptop_family
     _l134a = extract_laptop_attributes('Acer Predator Helios 300 Core i7 16GB 512GB', 'Acer')
     _l134b = extract_laptop_attributes('Acer Predator Triton 500 Core i9 32GB 1TB', 'Acer')
     if _l134a.get('laptop_family') != 'predator helios':
@@ -7435,7 +7495,7 @@ def self_test_verification() -> List[str]:
     if _l134b.get('laptop_family') != 'predator triton':
         failures.append(f'FAIL: Predator Triton laptop_family should be "predator triton", got "{_l134b.get("laptop_family")}"')
 
-    # 135. ASUS ROG Strix vs Zephyrus → distinct laptop_family
+    # 135. ASUS ROG Strix vs Zephyrus -> distinct laptop_family
     _l135a = extract_laptop_attributes('ASUS ROG Strix G15 Core i7 16GB 512GB', 'ASUS')
     _l135b = extract_laptop_attributes('ASUS ROG Zephyrus G14 Ryzen 9 16GB 1TB', 'ASUS')
     if _l135a.get('laptop_family') != 'rog strix':
@@ -7443,7 +7503,7 @@ def self_test_verification() -> List[str]:
     if _l135b.get('laptop_family') != 'rog zephyrus':
         failures.append(f'FAIL: ROG Zephyrus laptop_family should be "rog zephyrus", got "{_l135b.get("laptop_family")}"')
 
-    # 136. HP Pavilion 14 vs 15 → distinct laptop_family
+    # 136. HP Pavilion 14 vs 15 -> distinct laptop_family
     _l136a = extract_laptop_attributes('HP Pavilion 14 Core i5 8GB 256GB', 'HP')
     _l136b = extract_laptop_attributes('HP Pavilion 15 Core i5 8GB 512GB', 'HP')
     if _l136a.get('laptop_family') != 'pavilion 14':
@@ -7451,44 +7511,44 @@ def self_test_verification() -> List[str]:
     if _l136b.get('laptop_family') != 'pavilion 15':
         failures.append(f'FAIL: Pavilion 15 laptop_family should be "pavilion 15", got "{_l136b.get("laptop_family")}"')
 
-    # 137. HP EliteBook 840 → laptop_family includes model number
+    # 137. HP EliteBook 840 -> laptop_family includes model number
     _l137 = extract_laptop_attributes('HP EliteBook 840 G8 Core i5 16GB 512GB', 'HP')
     if _l137.get('laptop_family') != 'elitebook 840':
         failures.append(f'FAIL: EliteBook 840 laptop_family should be "elitebook 840", got "{_l137.get("laptop_family")}"')
 
-    # 138. Apple MacBook Pro → laptop_family = product_line
+    # 138. Apple MacBook Pro -> laptop_family = product_line
     _l138 = extract_laptop_attributes('Apple MacBook Pro M2 16GB 512GB', 'Apple')
     if _l138.get('laptop_family') != 'macbook pro':
         failures.append(f'FAIL: MacBook Pro laptop_family should be "macbook pro", got "{_l138.get("laptop_family")}"')
 
-    # 139. NL catalog format: "Acer, Aspire, 5 Series, ..." → aspire 5
+    # 139. NL catalog format: "Acer, Aspire, 5 Series, ..." -> aspire 5
     _l139 = extract_laptop_attributes('Acer, Aspire, 5 Series, Core i5, 7th Gen, 6 GB, A515, 1 TB', 'Acer')
     if _l139.get('laptop_family') != 'aspire 5':
         failures.append(f'FAIL: NL "Aspire 5 Series" laptop_family should be "aspire 5", got "{_l139.get("laptop_family")}"')
 
-    # 140. NL catalog: "HP, Pavilion, 15, ..." → pavilion 15
+    # 140. NL catalog: "HP, Pavilion, 15, ..." -> pavilion 15
     _l140 = extract_laptop_attributes('HP, Pavilion, 15, Core i3, 6th Gen, 4 GB, AY067ne, 1 TB', 'HP')
     if _l140.get('laptop_family') != 'pavilion 15':
         failures.append(f'FAIL: NL "Pavilion 15" laptop_family should be "pavilion 15", got "{_l140.get("laptop_family")}"')
 
     # ==================== model_code extraction tests ====================
 
-    # 141. Acer SF314-511 → model_code = sf314-511 (full suffix)
+    # 141. Acer SF314-511 -> model_code = sf314-511 (full suffix)
     _l141 = extract_laptop_attributes('Acer Swift 3 SF314-511 Core i5 8GB 512GB', 'Acer')
     if _l141.get('model_code') != 'sf314-511':
         failures.append(f'FAIL: Acer SF314-511 model_code should be "sf314-511", got "{_l141.get("model_code")}"')
 
-    # 142. Acer PH315-55 → model_code = ph315-55 (full suffix)
+    # 142. Acer PH315-55 -> model_code = ph315-55 (full suffix)
     _l142 = extract_laptop_attributes('Acer Predator Helios 300 PH315-55 Core i7 16GB 512GB', 'Acer')
     if _l142.get('model_code') != 'ph315-55':
         failures.append(f'FAIL: Acer PH315-55 model_code should be "ph315-55", got "{_l142.get("model_code")}"')
 
-    # 143. ASUS UX325 → model_code = ux325
+    # 143. ASUS UX325 -> model_code = ux325
     _l143 = extract_laptop_attributes('ASUS ZenBook UX325EA Core i7 16GB 512GB', 'ASUS')
     if _l143.get('model_code') != 'ux325':
         failures.append(f'FAIL: ASUS UX325 model_code should be "ux325", got "{_l143.get("model_code")}"')
 
-    # 144. ASUS FX504 → model_code = fx504
+    # 144. ASUS FX504 -> model_code = fx504
     _l144 = extract_laptop_attributes('Asus, TUF, FX Series, Core i7, 8th Gen, 4 GB, FX504, 1 TB', 'Asus')
     if _l144.get('model_code') != 'fx504':
         failures.append(f'FAIL: ASUS FX504 model_code should be "fx504", got "{_l144.get("model_code")}"')
@@ -7626,28 +7686,28 @@ def self_test_verification() -> List[str]:
 
     # --- V2 improvement patch self-tests ---
 
-    # 40. "One Plus" text normalization → "oneplus"
+    # 40. "One Plus" text normalization -> "oneplus"
     _nt_op = normalize_text('One Plus Nord 256GB')
     if 'oneplus' not in _nt_op:
         failures.append(f'FAIL: normalize_text("One Plus Nord") should contain "oneplus", got "{_nt_op}"')
 
-    # 41. Category inference: galaxy book → laptop
+    # 41. Category inference: galaxy book -> laptop
     if _infer_canonical_category_v2('Samsung Galaxy Book 15.6 i7', 'samsung', '') != 'laptop':
         failures.append('FAIL: "Galaxy Book" should infer as laptop')
 
-    # 42. Category inference: surface pro → tablet (no laptop tokens)
+    # 42. Category inference: surface pro -> tablet (no laptop tokens)
     if _infer_canonical_category_v2('Microsoft Surface Pro 9 i7 256GB', 'microsoft', '') != 'tablet':
         failures.append('FAIL: "Surface Pro" should infer as tablet')
 
-    # 43. Category inference: SM-G960F → mobile (normalized, no hyphen)
+    # 43. Category inference: SM-G960F -> mobile (normalized, no hyphen)
     if _infer_canonical_category_v2('samsung sm g960f 64gb', 'samsung', '') != 'mobile':
         failures.append('FAIL: "SM-G960F" (normalized) should infer as mobile')
 
-    # 44. Category inference: Huawei Mate 30 → mobile
+    # 44. Category inference: Huawei Mate 30 -> mobile
     if _infer_canonical_category_v2('Huawei Mate 30 Pro 256GB', 'huawei', '') != 'mobile':
         failures.append('FAIL: "Huawei Mate 30" should infer as mobile')
 
-    # 45. Category inference: Xiaomi 15 → mobile
+    # 45. Category inference: Xiaomi 15 -> mobile
     if _infer_canonical_category_v2('Xiaomi 15 Ultra 256GB', 'xiaomi', '') != 'mobile':
         failures.append('FAIL: "Xiaomi 15" should infer as mobile')
 
@@ -7661,17 +7721,17 @@ def self_test_verification() -> List[str]:
     if _xm.get('product_line') != 'mi':
         failures.append(f'FAIL: "Xiaomi Mi 11 Ultra" product_line should be "mi", got "{_xm.get("product_line")}"')
 
-    # 48. Model family: Samsung SM-N986 → galaxy note family
+    # 48. Model family: Samsung SM-N986 -> galaxy note family
     _smn = extract_model_family_key('Samsung SM-N986B 256GB', 'mobile', 'samsung')
     if 'galaxy note' not in _smn:
         failures.append(f'FAIL: SM-N986 should map to galaxy note family, got "{_smn}"')
 
-    # 49. Model family: Samsung SM-G960F → galaxy s family
+    # 49. Model family: Samsung SM-G960F -> galaxy s family
     _smg = extract_model_family_key('Samsung SM-G960F 64GB', 'mobile', 'samsung')
     if 'galaxy s' not in _smg:
         failures.append(f'FAIL: SM-G960F should map to galaxy s family, got "{_smg}"')
 
-    # 50. Model family: Xiaomi 15 Ultra → xiaomi family key
+    # 50. Model family: Xiaomi 15 Ultra -> xiaomi family key
     _xmfk = extract_model_family_key('Xiaomi 15 Ultra 256GB', 'mobile', 'xiaomi')
     if 'xiaomi 15' not in _xmfk:
         failures.append(f'FAIL: "Xiaomi 15 Ultra" family key should contain "xiaomi 15", got "{_xmfk}"')
@@ -7769,7 +7829,7 @@ def self_test_verification() -> List[str]:
         failures.append(
             f'FAIL: Laptop norm — "14 inch" should be preserved, got "{_lnorm4}"')
 
-    # 64. Parentheses with only noise → fully removed
+    # 64. Parentheses with only noise -> fully removed
     _lnorm5 = normalize_laptop_query_text_v2('MacBook Air (4 TBT3, Wi-Fi 6)')
     if 'tbt' in _lnorm5.lower() or 'wi-fi' in _lnorm5.lower():
         failures.append(
@@ -7802,36 +7862,36 @@ def self_test_verification() -> List[str]:
 
     # ==================== TASK 5: Policy-class + cross-join regression tests ====================
 
-    # 154. laptop_policy_class: MacBook Pro → APPLE_MACBOOK
+    # 154. laptop_policy_class: MacBook Pro -> APPLE_MACBOOK
     _policy154 = laptop_policy_class('Apple MacBook Pro M2 16GB 512GB', 'Apple',
                                      extract_laptop_attributes('Apple MacBook Pro M2 16GB 512GB', 'Apple'))
     if _policy154 != 'APPLE_MACBOOK':
         failures.append(f'FAIL: MacBook Pro policy should be APPLE_MACBOOK, got "{_policy154}"')
 
-    # 155. laptop_policy_class: Dell Latitude → WINDOWS_BUSINESS
+    # 155. laptop_policy_class: Dell Latitude -> WINDOWS_BUSINESS
     _policy155 = laptop_policy_class('Dell Latitude 5420 Core i5 16GB 512GB', 'Dell',
                                      extract_laptop_attributes('Dell Latitude 5420 Core i5 16GB 512GB', 'Dell'))
     if _policy155 != 'WINDOWS_BUSINESS':
         failures.append(f'FAIL: Dell Latitude policy should be WINDOWS_BUSINESS, got "{_policy155}"')
 
-    # 156. laptop_policy_class: ASUS ROG Strix → WINDOWS_GAMING
+    # 156. laptop_policy_class: ASUS ROG Strix -> WINDOWS_GAMING
     _policy156 = laptop_policy_class('ASUS ROG Strix G15 Core i7 16GB 512GB RTX 3060', 'ASUS',
                                      extract_laptop_attributes('ASUS ROG Strix G15 Core i7 16GB 512GB RTX 3060', 'ASUS'))
     if _policy156 != 'WINDOWS_GAMING':
         failures.append(f'FAIL: ROG Strix policy should be WINDOWS_GAMING, got "{_policy156}"')
 
-    # 157. laptop_policy_class: Acer Aspire (no gaming) → WINDOWS_OTHER
+    # 157. laptop_policy_class: Acer Aspire (no gaming) -> WINDOWS_OTHER
     _policy157 = laptop_policy_class('Acer Aspire 5 Core i5 8GB 256GB', 'Acer',
                                      extract_laptop_attributes('Acer Aspire 5 Core i5 8GB 256GB', 'Acer'))
     if _policy157 != 'WINDOWS_OTHER':
         failures.append(f'FAIL: Acer Aspire policy should be WINDOWS_OTHER, got "{_policy157}"')
 
-    # 158. screen_inches extraction: "14 inch" → "14"
+    # 158. screen_inches extraction: "14 inch" -> "14"
     _si158 = extract_laptop_attributes('Dell Latitude 14 inch Core i5 16GB 512GB', 'Dell')
     if _si158.get('screen_inches') != '14':
         failures.append(f'FAIL: screen_inches should be "14", got "{_si158.get("screen_inches")}"')
 
-    # 159. apple_chip extraction: "M2 Pro" → "m2 pro"
+    # 159. apple_chip extraction: "M2 Pro" -> "m2 pro"
     _ac159 = extract_laptop_attributes('Apple MacBook Pro M2 Pro 16GB 512GB', 'Apple')
     if _ac159.get('apple_chip') != 'm2 pro':
         failures.append(f'FAIL: apple_chip should be "m2 pro", got "{_ac159.get("apple_chip")}"')
@@ -7843,7 +7903,7 @@ def self_test_verification() -> List[str]:
     if sorted(_ds160.get('storage_list', [])) != [256, 1024]:
         failures.append(f'FAIL: storage_list should be [256, 1024], got {_ds160.get("storage_list")}')
 
-    # 161. Dual-storage query → always REVIEW_REQUIRED (never MATCHED)
+    # 161. Dual-storage query -> always REVIEW_REQUIRED (never MATCHED)
     _nl161 = ['dell latitude core i5 gen11 16gb 256gb ssd']
     _lu161 = {_nl161[0]: ['NL-DUAL-161']}
     _r161 = match_laptop_by_attributes(
@@ -7879,7 +7939,7 @@ def self_test_verification() -> List[str]:
         if _r163.get('mapped_uae_assetid') == 'NL-MBA13':
             failures.append('FAIL: MacBook Air 15" should NOT match 13" as MATCHED')
 
-    # 164. Dell Latitude 7320 with missing CPU/RAM/storage → None (incomplete)
+    # 164. Dell Latitude 7320 with missing CPU/RAM/storage -> None (incomplete)
     _nl164 = ['dell latitude 7320 core i5 gen11 16gb 512gb ssd']
     _lu164 = {_nl164[0]: ['NL-LAT-7320']}
     _r164 = match_laptop_by_attributes(
@@ -7889,7 +7949,7 @@ def self_test_verification() -> List[str]:
     if _r164 is not None and _r164.get('match_status') == MATCH_STATUS_MATCHED:
         failures.append('FAIL: Dell Latitude 7320 with no specs should not be MATCHED')
 
-    # 165. ROG Zephyrus should NOT match ROG Strix as MATCHED (family mismatch → skip)
+    # 165. ROG Zephyrus should NOT match ROG Strix as MATCHED (family mismatch -> skip)
     _nl165_strix = 'asus rog strix g15 core i7 gen11 16gb 512gb ssd'
     _nl165_zeph = 'asus rog zephyrus g14 ryzen 9 gen11 16gb 1024gb ssd'
     _nl165 = [_nl165_strix, _nl165_zeph]
@@ -7909,7 +7969,7 @@ def self_test_verification() -> List[str]:
     if not _pass166:
         failures.append('FAIL: iPhone 15 Pro should still match itself (non-laptop unchanged)')
 
-    # 167. Completeness gate: WINDOWS_BUSINESS without code/family → REVIEW
+    # 167. Completeness gate: WINDOWS_BUSINESS without code/family -> REVIEW
     _nl167 = ['dell latitude core i5 gen11 16gb 512gb ssd']
     _lu167 = {_nl167[0]: ['NL-BIZ-167']}
     _r167 = match_laptop_by_attributes(
@@ -7917,7 +7977,7 @@ def self_test_verification() -> List[str]:
         'dell', 'Dell Latitude Core i5 11th Gen 16GB 512GB',
         _nl167, _lu167, None)
     # This query has product_line=latitude but no platform_code or laptop_family
-    # → completeness gate should fail (missing code_or_family for WINDOWS_BUSINESS)
+    # -> completeness gate should fail (missing code_or_family for WINDOWS_BUSINESS)
     # It should NOT be MATCHED
     if _r167 is not None and _r167.get('match_status') == MATCH_STATUS_MATCHED:
         _q167_attrs = extract_laptop_attributes('dell latitude core i5 gen11 16gb 512gb ssd', 'dell')
@@ -7927,7 +7987,7 @@ def self_test_verification() -> List[str]:
         if not _q167_fam and not _q167_pc:
             failures.append('FAIL: WINDOWS_BUSINESS without code/family should be REVIEW, not MATCHED')
 
-    # 168. Score margin test: two identical candidates → REVIEW (margin=0)
+    # 168. Score margin test: two identical candidates -> REVIEW (margin=0)
     _nl168_a = 'hp elitebook 840 g8 core i5 gen11 16gb 512gb ssd'
     _nl168_b = 'hp elitebook 840 g8 core i5 gen11 16gb 512gb ssd'
     _nl168 = [_nl168_a]
@@ -7936,7 +7996,7 @@ def self_test_verification() -> List[str]:
         'hp elitebook 840 g8 core i5 gen11 16gb 512gb ssd',
         'hp', 'HP EliteBook 840 G8 Core i5 11th Gen 16GB 512GB',
         _nl168, _lu168, None)
-    # Multi-ID with same name → goes to tie-break path
+    # Multi-ID with same name -> goes to tie-break path
     # Since both resolve to same NL name (no platform code differentiation in catalog),
     # should be REVIEW (multi-ID)
     if _r168 is not None and _r168.get('match_status') == MATCH_STATUS_MATCHED:
@@ -7976,7 +8036,7 @@ def _infer_canonical_category_v2(text: str, brand_hint: str = '', current_catego
         return 'watch'
     if b == 'apple' and 'ipad' in t:
         return 'tablet'
-    # Tablet keywords (surface pro/go → tablet when no laptop tokens present)
+    # Tablet keywords (surface pro/go -> tablet when no laptop tokens present)
     if any(kw in t for kw in ('ipad', 'galaxy tab', 'tab s', 'tab a', 'mediapad', 'matepad')):
         return 'tablet'
     if re.search(r'\bsurface\s+(?:pro|go)\b', t) and not any(
@@ -8001,24 +8061,24 @@ def _infer_canonical_category_v2(text: str, brand_hint: str = '', current_catego
                                'lumia', 'nokia ', 'surface duo', 'htc',
                                'blackberry', 'zenfone', 'vibe')):
         return 'mobile'
-    # Huawei phone families: mate/p/nova/pura + number → mobile
+    # Huawei phone families: mate/p/nova/pura + number -> mobile
     if ('huawei' in t or b == 'huawei') and re.search(
             r'\b(?:mate\s*\d|p\d{2}|p\s+\d{2}|nova\s*\d|pura\s*\d)', t):
         return 'mobile'
-    # Xiaomi/Mi numbered series → mobile
+    # Xiaomi/Mi numbered series -> mobile
     if ('xiaomi' in t or b == 'xiaomi') and re.search(r'\bxiaomi\s+\d+|mi\s+\d+', t):
         return 'mobile'
     # Samsung model codes (GT-/SM-) are overwhelmingly mobile
-    # normalize_text strips hyphens → "SM-G960F" becomes "sm g960f", so match both forms
+    # normalize_text strips hyphens -> "SM-G960F" becomes "sm g960f", so match both forms
     if re.search(r'\b(?:gt|sm)[\s-]?[a-z]\d{3}', t):
         return 'mobile'
     # Lenovo V-series: V14, V15, V17 are budget laptops
     if b == 'lenovo' and re.search(r'\bv\d{2}\b', t):
         return 'laptop'
-    # Lenovo Miix → tablet (detachable)
+    # Lenovo Miix -> tablet (detachable)
     if 'miix' in t:
         return 'tablet'
-    # Samsung Galaxy View → tablet (large screen portable)
+    # Samsung Galaxy View -> tablet (large screen portable)
     if 'galaxy view' in t:
         return 'tablet'
     return current_category or 'other'
@@ -8098,7 +8158,7 @@ def extract_model_family_key(text: str, category: str = '', brand_hint: str = ''
                     variant = v
                     break
             return f'huawei {base} {variant}'.strip()
-        # Huawei model-code fallback: CLT-L29, VOG-L29, etc. → stable key
+        # Huawei model-code fallback: CLT-L29, VOG-L29, etc. -> stable key
         if 'huawei' in t or (brand_hint or '').lower() == 'huawei':
             m = re.search(r'\b([a-z]{3})\s*[a-z]?\d{2,3}\b', t)
             if m:
@@ -8145,8 +8205,8 @@ def extract_model_family_key(text: str, category: str = '', brand_hint: str = ''
 
         # Samsung model codes (GT-/SM- hardware identifiers)
         # Map known prefixes to Galaxy families when possible:
-        #   SM-N / GT-N → Galaxy Note, SM-G / GT-I → Galaxy S,
-        #   SM-A → Galaxy A, SM-M → Galaxy M, SM-F → Galaxy Z (Fold/Flip)
+        #   SM-N / GT-N -> Galaxy Note, SM-G / GT-I -> Galaxy S,
+        #   SM-A -> Galaxy A, SM-M -> Galaxy M, SM-F -> Galaxy Z (Fold/Flip)
         # normalize_text turns "GT-I9500" into "gt i9500", so match both forms
         _SM_FAMILY_MAP = {
             'n': 'galaxy note', 'g': 'galaxy s', 'i': 'galaxy s',
@@ -8155,7 +8215,7 @@ def extract_model_family_key(text: str, category: str = '', brand_hint: str = ''
         }
         m = re.search(r'((?:gt|sm)[\s-]?([a-z])\d{3,5})', t)
         if m:
-            code = re.sub(r'\s+', '-', m.group(1))  # normalize "gt i9500" → "gt-i9500"
+            code = re.sub(r'\s+', '-', m.group(1))  # normalize "gt i9500" -> "gt-i9500"
             family_letter = m.group(2).lower()
             family = _SM_FAMILY_MAP.get(family_letter, '')
             if family:
@@ -8816,3 +8876,59 @@ def generate_schema_audit_v2(all_results: Dict[str, pd.DataFrame]) -> pd.DataFra
                  'examples': f'{pct} covered ({review_with_alts} alts, {review_with_blk} blk)'})
 
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for URL helpers  (run:  python matcher_v2.py --test-url)
+# ---------------------------------------------------------------------------
+
+def _run_url_tests() -> None:
+    """5 focused tests for _is_url and extract_name_from_url."""
+    passed = 0
+    failed = 0
+
+    def _assert(cond, label):
+        nonlocal passed, failed
+        if cond:
+            passed += 1
+            print(f'  PASS  {label}')
+        else:
+            failed += 1
+            print(f'  FAIL  {label}')
+
+    print('--- URL helper tests ---')
+
+    # 1. Scheme-less bare domain parses a product name
+    name = extract_name_from_url('example.com/iphone-15-128gb')
+    _assert(name and 'iphone' in name.lower() and '128gb' in name.lower(),
+            f'1) bare domain -> "{name}"')
+
+    # 2. Protocol-relative URL parses
+    name = extract_name_from_url('//example.com/iphone-15-128gb')
+    _assert(name and 'iphone' in name.lower(),
+            f'2) protocol-relative -> "{name}"')
+
+    # 3. Embedded URL (text before the https://)
+    name = extract_name_from_url('url: https://example.com/iphone-15-128gb')
+    _assert(name and 'iphone' in name.lower(),
+            f'3) embedded URL -> "{name}"')
+
+    # 4. Numeric last segment falls back to prior segment
+    name = extract_name_from_url('https://example.com/samsung-galaxy-s23-256gb/12345')
+    _assert(name and 'galaxy' in name.lower(),
+            f'4) numeric last seg fallback -> "{name}"')
+
+    # 5. Normal non-URL text is unchanged by _is_url
+    for plain in ['iPhone 15 128GB', 'Samsung Galaxy S23', 'Zo goed als nieuw']:
+        _assert(not _is_url(plain),
+                f'5) _is_url("{plain}") -> False')
+
+    print(f'\n{passed} passed, {failed} failed')
+    if failed:
+        raise SystemExit(1)
+
+
+if __name__ == '__main__':
+    import sys
+    if '--test-url' in sys.argv:
+        _run_url_tests()
