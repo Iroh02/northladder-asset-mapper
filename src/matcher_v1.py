@@ -246,6 +246,8 @@ def extract_name_from_url(url: str) -> str:
     Handles common e-commerce URL patterns:
         https://www.recommerce.com/fr/iphone-15-128go-bleu → 'iphone 15 128go bleu'
         https://example.com/products/samsung-galaxy-s23-256gb → 'samsung galaxy s23 256gb'
+        .../catalog/product/view/id/11227/s/iphone-14-128gb-geel-4/category/4/
+            → 'iphone 14 128gb geel 4'  (picks the /s/ slug, not /category/4)
 
     Returns empty string if parsing fails or no meaningful name found.
     """
@@ -253,26 +255,52 @@ def extract_name_from_url(url: str) -> str:
         return ''
     try:
         parsed = urlparse(url.strip())
-        # Use the last meaningful path segment
         path = unquote(parsed.path).strip('/')
         if not path:
             return ''
-        # Take last segment (most specific), e.g., "iphone-15-128go-bleu"
-        slug = path.split('/')[-1]
-        # Remove common file extensions
-        slug = re.sub(r'\.(html?|php|aspx?|jsp)$', '', slug, flags=re.IGNORECASE)
-        # Remove query-like suffixes that leaked into the slug
-        slug = re.sub(r'[?#].*', '', slug)
-        # Replace hyphens/underscores with spaces
-        name = slug.replace('-', ' ').replace('_', ' ')
-        # Remove pure-numeric segments and UUIDs
-        name = re.sub(r'\b[0-9a-f]{8,}\b', '', name)
-        # Collapse whitespace
-        name = re.sub(r'\s+', ' ', name).strip()
-        # Reject if too short (likely not a product name)
-        if len(name) < 4:
-            return ''
-        return name
+
+        segments = path.split('/')
+
+        def _slug_to_name(slug: str) -> str:
+            slug = re.sub(r'\.(html?|php|aspx?|jsp)$', '', slug, flags=re.IGNORECASE)
+            slug = re.sub(r'[?#].*', '', slug)
+            name = slug.replace('-', ' ').replace('_', ' ')
+            name = re.sub(r'\b[0-9a-f]{8,}\b', '', name)
+            return re.sub(r'\s+', ' ', name).strip()
+
+        # Path segments that are never product names
+        _SKIP_SEGMENTS = {
+            'category', 'catalog', 'product', 'products', 'view',
+            'shop', 'item', 'items', 'page', 'detail', 'details',
+            'collections', 'collection',
+        }
+
+        def _is_good_slug(name: str) -> bool:
+            """Good slug has letters AND digits, ≥4 chars, not noise path."""
+            return (
+                len(name) >= 4
+                and bool(re.search(r'[a-zA-Z]', name))
+                and bool(re.search(r'[0-9]', name))
+                and not re.fullmatch(r'[0-9]+', name)
+                and not re.fullmatch(r'[0-9a-f-]{20,}', name)
+                and name.lower() not in _SKIP_SEGMENTS
+            )
+
+        # Try last segment first (most specific)
+        best = _slug_to_name(segments[-1])
+        if _is_good_slug(best):
+            return best
+
+        # Fallback: scan all segments in reverse, pick the best slug-like one
+        for seg in reversed(segments[:-1]):
+            candidate = _slug_to_name(seg)
+            if _is_good_slug(candidate):
+                return candidate
+
+        # Final fallback
+        if len(best) >= 4:
+            return best
+        return ''
     except Exception:
         return ''
 
@@ -288,10 +316,15 @@ _COLOR_WORDS = {
     'bleu', 'noir', 'vert', 'rose', 'jaune', 'rouge', 'blanc', 'gris',
     'argent', 'or', 'violet', 'orange', 'corail', 'sideral', 'ciel',
     'sable', 'lumiere', 'minuit', 'creme',
+    # Dutch
+    'blauw', 'zwart', 'wit', 'groen', 'rood', 'goud', 'zilver', 'paars',
+    'roze', 'geel', 'grijs', 'bruin',
     # English
     'black', 'white', 'blue', 'green', 'red', 'gold', 'silver', 'purple',
     'pink', 'yellow', 'orange', 'coral', 'graphite', 'midnight', 'starlight',
-    'cream', 'titanium', 'space', 'grey', 'gray', 'sierra',
+    'cream', 'titanium', 'space', 'grey', 'gray', 'sierra', 'natural',
+    # URL noise (SIM, region, grade)
+    'nano', 'dual', 'sim', 'dualsim', 'esim', 'eu', 'grade', 'refurbished',
 }
 
 def strip_color_words(text: str) -> str:
@@ -310,6 +343,17 @@ def strip_color_words(text: str) -> str:
         return text
     words = text.split()
     filtered = [w for w in words if w.lower() not in _COLOR_WORDS]
+    # Strip trailing noise: single chars ("a" from "a grade") and
+    # small standalone numbers that aren't storage (e.g. "4" variant ID)
+    while filtered:
+        last = filtered[-1]
+        if len(last) <= 1:
+            filtered.pop()
+        elif last.isdigit() and int(last) < 10:
+            # Small numbers (1-9) at end are variant IDs, not product info
+            filtered.pop()
+        else:
+            break
     return ' '.join(filtered).strip()
 
 
@@ -5430,6 +5474,24 @@ def parse_asset_sheets(file) -> Dict[str, Dict]:
             # Detect brand and name columns
             col_map = _detect_columns(raw_headers)
 
+            # --- URL → product name extraction ---
+            _url_col_name = None
+            for _c in raw_headers:
+                if _c.lower().strip() in ('url', 'product_url', 'link', 'href'):
+                    _url_col_name = _c
+                    break
+            if _url_col_name:
+                df['product_name'] = (
+                    df[_url_col_name]
+                    .apply(extract_name_from_url)
+                    .apply(strip_color_words)
+                )
+                _valid = df['product_name'].str.strip().ne('').sum()
+                if _valid >= len(df) * 0.5:
+                    col_map['name_col'] = 'product_name'
+                else:
+                    df.drop(columns=['product_name'], inplace=True)
+
             if col_map['name_col'] is None:
                 return results  # Can't match without a product name column
 
@@ -5488,6 +5550,24 @@ def parse_asset_sheets(file) -> Dict[str, Dict]:
 
             # Detect brand and name columns
             col_map = _detect_columns(raw_headers)
+
+            # --- URL → product name extraction ---
+            _url_col_name = None
+            for _c in raw_headers:
+                if _c.lower().strip() in ('url', 'product_url', 'link', 'href'):
+                    _url_col_name = _c
+                    break
+            if _url_col_name:
+                df['product_name'] = (
+                    df[_url_col_name]
+                    .apply(extract_name_from_url)
+                    .apply(strip_color_words)
+                )
+                _valid = df['product_name'].str.strip().ne('').sum()
+                if _valid >= len(df) * 0.5:
+                    col_map['name_col'] = 'product_name'
+                else:
+                    df.drop(columns=['product_name'], inplace=True)
 
             if col_map['name_col'] is None:
                 continue  # Can't match without a product name column

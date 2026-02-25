@@ -382,9 +382,21 @@ def _apply_analyst_cols(df, output_cols):
 
 
 def _apply_analyst_review(df):
-    """Apply Analyst View filtering to Review Required sheets."""
-    cols = _strip_mms_if_uae([c for c in _ANALYST_REVIEW_COLS if c in df.columns])
-    return df[cols]
+    """Apply Analyst View filtering to Review Required sheets.
+
+    Prepends original input columns (url, grade, price, description, etc.)
+    before the curated review columns so analysts see source metadata.
+    """
+    original_cols = [c for c in df.columns if c not in _MATCHER_ADDED_COLS
+                     and c != 'Source Sheet']
+    curated = _strip_mms_if_uae([c for c in _ANALYST_REVIEW_COLS if c in df.columns])
+    # Source Sheet always first, then original input cols, then curated review cols
+    final = ['Source Sheet'] + original_cols if 'Source Sheet' in df.columns else original_cols
+    for c in curated:
+        if c not in final:
+            final.append(c)
+    final = [c for c in final if c in df.columns]
+    return df[final]
 
 
 def _prepare_analyst_unmatched(df, df_nl_clean):
@@ -1238,9 +1250,12 @@ with tab2:
                         _apply_analyst_review(df_review_combined).to_excel(
                             writer, sheet_name='Review Required', index=False)
                     else:
-                        # Debug View: full curated column set
-                        review_cols = [
-                            'Source Sheet', 'original_input', 'category',
+                        # Debug View: original input cols + full curated column set
+                        # Original cols = everything the user uploaded (url, grade, price, etc.)
+                        _orig_cols = [c for c in df_review_combined.columns
+                                      if c not in _MATCHER_ADDED_COLS and c != 'Source Sheet']
+                        review_cols = ['Source Sheet'] + _orig_cols + [
+                            'original_input', 'category',
                             'review_priority', 'review_summary',
                             'mapped_uae_assetid', 'nl_product_name',
                             'match_score', 'match_status', 'confidence',
@@ -1255,6 +1270,10 @@ with tab2:
                             'blk_3_id', 'blk_3_name', 'blk_3_score', 'blk_3_reason',
                             'verification_pass', 'verification_reasons',
                         ]
+                        # Deduplicate while preserving order
+                        _seen = set()
+                        review_cols = [c for c in review_cols
+                                       if c not in _seen and not _seen.add(c)]
                         if primary_output_choice == 'MMS':
                             _mms_insert = review_cols.index('mapped_uae_assetid') + 1
                             for _mc in reversed(['mms_asset_id', 'mms_asset_label', 'mms_lookup_status',
@@ -1299,9 +1318,20 @@ with tab2:
                         # MMS enrichment for auto-selected
                         _mid, _mlbl, _mst = _mms_lookup_single(selected_id, mms_map)
 
+                        # Collect original input metadata (url, grade, price, etc.)
+                        _orig_meta = {}
+                        for c in row.index:
+                            if c not in _MATCHER_ADDED_COLS and c != 'Source Sheet':
+                                val = row[c]
+                                if pd.notna(val) and str(val).strip():
+                                    _orig_meta[c] = val
+
                         detail = {
                             'Source Sheet': sheet_name,
                             'Your Product': original_name,
+                        }
+                        detail.update(_orig_meta)
+                        detail.update({
                             'Matched To': row['matched_on'],
                             'Match Score': f"{row['match_score']:.1f}%",
                             'Selected ID': selected_id,
@@ -1309,7 +1339,7 @@ with tab2:
                             'Selection Reason': row.get('selection_reason', 'N/A'),
                             'Alternative IDs': ', '.join(alt_ids) if alt_ids else 'None',
                             'Total Variants': len(alt_ids) + 1,
-                        }
+                        })
                         if mms_map:
                             detail['mms_asset_id'] = _mid
                             detail['mms_asset_label'] = _mlbl
@@ -1629,8 +1659,10 @@ with tab2:
                             _apply_analyst_review(df_rev_v2).to_excel(
                                 writer, sheet_name='Review Required (V2)', index=False)
                         else:
-                            rev_cols_v2 = [
-                                'Source Sheet', 'original_input', 'category',
+                            _orig_cols_v2 = [c for c in df_rev_v2.columns
+                                             if c not in _MATCHER_ADDED_COLS and c != 'Source Sheet']
+                            rev_cols_v2 = ['Source Sheet'] + _orig_cols_v2 + [
+                                'original_input', 'category',
                                 'mapped_uae_assetid', 'nl_product_name',
                                 'match_score', 'match_status', 'confidence',
                                 'matched_on', 'method',
@@ -1644,6 +1676,9 @@ with tab2:
                                 'blk_3_id', 'blk_3_name', 'blk_3_score', 'blk_3_reason',
                                 'verification_pass', 'verification_reasons',
                             ]
+                            _seen_v2 = set()
+                            rev_cols_v2 = [c for c in rev_cols_v2
+                                           if c not in _seen_v2 and not _seen_v2.add(c)]
                             if primary_output_choice == 'MMS':
                                 _ins = rev_cols_v2.index('mapped_uae_assetid') + 1
                                 for _mc in reversed(['mms_asset_id', 'mms_asset_label', 'mms_lookup_status',
@@ -2007,8 +2042,11 @@ if tab3 is not None:
                                 _apply_analyst_review(df_review_combined).to_excel(
                                     writer, sheet_name='Review Required', index=False)
                             else:
-                                review_cols = [
-                                    'Source Sheet', 'original_input', 'category',
+                                # Debug View: prepend original input cols (url, grade, price…)
+                                _orig_cols_ovr = [c for c in df_review_combined.columns
+                                                  if c not in _MATCHER_ADDED_COLS and c != 'Source Sheet']
+                                review_cols = ['Source Sheet'] + _orig_cols_ovr + [
+                                    'original_input', 'category',
                                     'mapped_uae_assetid',
                                     'match_score', 'match_status',
                                     'confidence', 'matched_on', 'method',
@@ -2020,6 +2058,10 @@ if tab3 is not None:
                                     for _mc in reversed(['mms_asset_id', 'mms_asset_label', 'mms_lookup_status',
                                                          'primary_output_id', 'primary_output_catalog']):
                                         review_cols.insert(_ins, _mc)
+                                # Deduplicate while preserving order
+                                _seen_ovr = set()
+                                review_cols = [c for c in review_cols
+                                               if c not in _seen_ovr and not _seen_ovr.add(c)]
                                 review_cols = [c for c in review_cols if c in df_review_combined.columns]
                                 df_review_combined[review_cols].to_excel(
                                     writer, sheet_name='Review Required', index=False)
@@ -2046,9 +2088,19 @@ if tab3 is not None:
                                 selected_name = nl_entry.iloc[0]['uae_assetname'] if len(nl_entry) > 0 else 'N/A'
 
                                 _mid, _mlbl, _mst = _mms_lookup_single(selected_id, mms_map)
+                                # Collect original input metadata (url, grade, price…)
+                                _orig_meta_ovr = {}
+                                for c in row.index:
+                                    if c not in _MATCHER_ADDED_COLS and c != 'Source Sheet':
+                                        val = row[c]
+                                        if pd.notna(val) and str(val).strip():
+                                            _orig_meta_ovr[c] = val
                                 detail_ovr = {
                                     'Source Sheet': sheet_name,
                                     'Your Product': original_name,
+                                }
+                                detail_ovr.update(_orig_meta_ovr)
+                                detail_ovr.update({
                                     'Matched To': row['matched_on'],
                                     'Match Score': f"{row['match_score']:.1f}%",
                                     'Selected ID': selected_id,
@@ -2056,7 +2108,7 @@ if tab3 is not None:
                                     'Selection Reason': row.get('selection_reason', 'N/A'),
                                     'Alternative IDs': ', '.join(alt_ids) if alt_ids else 'None',
                                     'Total Variants': len(alt_ids) + 1,
-                                }
+                                })
                                 if mms_map:
                                     detail_ovr['mms_asset_id'] = _mid
                                     detail_ovr['mms_asset_label'] = _mlbl

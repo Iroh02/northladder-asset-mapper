@@ -6268,26 +6268,20 @@ def parse_asset_sheets(file) -> Dict[str, Dict]:
                 if _c.lower().strip() in ('url', 'product_url', 'link', 'href'):
                     _url_col_name = _c
                     break
-            if _url_col_name and col_map['name_col']:
-                _nunique = df[col_map['name_col']].nunique()
-                _total = max(len(df), 1)
-                if _nunique / _total < 0.1 and _nunique <= 10:
-                    # Name column is categorical -> extract product names from URLs
-                    df['product_name'] = (
-                        df[_url_col_name]
-                        .apply(extract_name_from_url)
-                        .apply(_clean_url_extracted_name)
-                    )
-                    col_map['name_col'] = 'product_name'
-            # Also handle the case where no name column was detected at all
-            # but a URL column exists
-            if col_map['name_col'] is None and _url_col_name:
+            if _url_col_name:
+                # Always extract product names from URLs when a URL column exists.
+                # URL slugs (e.g. "iphone-15-plus-128gb-blauw") are more reliable
+                # product identifiers than generic description/grade columns.
                 df['product_name'] = (
                     df[_url_col_name]
                     .apply(extract_name_from_url)
                     .apply(_clean_url_extracted_name)
                 )
-                col_map['name_col'] = 'product_name'
+                _valid = df['product_name'].str.strip().ne('').sum()
+                if _valid >= len(df) * 0.5:  # ≥50% extracted successfully
+                    col_map['name_col'] = 'product_name'
+                else:
+                    df.drop(columns=['product_name'], inplace=True)
 
             if col_map['name_col'] is None:
                 return results  # Can't match without a product name column
@@ -6354,23 +6348,17 @@ def parse_asset_sheets(file) -> Dict[str, Dict]:
                 if _c.lower().strip() in ('url', 'product_url', 'link', 'href'):
                     _url_col_name = _c
                     break
-            if _url_col_name and col_map['name_col']:
-                _nunique = df[col_map['name_col']].nunique()
-                _total = max(len(df), 1)
-                if _nunique / _total < 0.1 and _nunique <= 10:
-                    df['product_name'] = (
-                        df[_url_col_name]
-                        .apply(extract_name_from_url)
-                        .apply(_clean_url_extracted_name)
-                    )
-                    col_map['name_col'] = 'product_name'
-            if col_map['name_col'] is None and _url_col_name:
+            if _url_col_name:
                 df['product_name'] = (
                     df[_url_col_name]
                     .apply(extract_name_from_url)
                     .apply(_clean_url_extracted_name)
                 )
-                col_map['name_col'] = 'product_name'
+                _valid = df['product_name'].str.strip().ne('').sum()
+                if _valid >= len(df) * 0.5:
+                    col_map['name_col'] = 'product_name'
+                else:
+                    df.drop(columns=['product_name'], inplace=True)
 
             if col_map['name_col'] is None:
                 continue  # Can't match without a product name column
